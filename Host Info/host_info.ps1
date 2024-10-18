@@ -21,7 +21,7 @@ $scriptVersion = "3.0d"
 # v3.0a - 18/10/2024 - Modularised
 # v3.0b - 18/10/2024 - Renamed and standardised functions and variables
 # v3.0c - 18/10/2024 - Further modularisation and add extra comments
-# v3.0d - 18/10/2024 - Optimised cmdlets and additional user feedback
+# v3.0d - 18/10/2024 - Optimised cmdlets
 
 # Import the SCCM module
 Import-Module 'C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1'
