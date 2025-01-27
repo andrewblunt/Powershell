@@ -465,7 +465,7 @@ function ProcessLoadedProfiles {
 
             try {
                 $adUser = Get-ADUser -Identity $lastUser -Properties *
-                Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
+                Write-Host " $($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
             } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                 Write-Warning "Using a local account or inactive AD account"
             } catch {
@@ -509,7 +509,7 @@ function ProcessHost {
                     $whoLoggedIn = $whoLoggedIn -replace ".*\\"
                     try {
                         $adUser = Get-ADUser -Identity $whoLoggedIn -Properties *
-                        Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
+                        Write-Host " $($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
                     } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                         Write-Warning "User is not an AD user account"
                     }
