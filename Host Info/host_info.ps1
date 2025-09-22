@@ -1,5 +1,5 @@
 ﻿# Script version
-$scriptVersion = "3.5"
+$scriptVersion = "3.6a"
 
 # Script to read a host name from user
 # Output to screen if PC online, Login details, IP address, OS used and Diskspace, S/N
@@ -28,6 +28,7 @@ $scriptVersion = "3.5"
 # v3.3  - 13/01/2024 - Working on issues where there are multiple previous profiles. Array is required for multiple but then doesn't work if only 1 last user.
 # v3.4  - 13/01/2024 - Copilot suggested optimisations: Reduce redundant calls, improve error handling to be more specific and informative, group related options into try and catch, simplified logic checking for $userProfiles.
 # v3.5  - 16/01/2024 - Modularised ProcessHost, added parameter validation, improved error handing, added comments to code.
+# v3.6  - 22/09/2025 - Include OS Build Number in output (remote reg query)
 
 # Import the SCCM module
 Import-Module 'C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1'
@@ -227,6 +228,29 @@ function GetDiskSpace {
         }
     } catch {
         Write-Warning "Failed to retrieve disk space information for $hostName"
+    }
+}
+
+function GetWindowsBuildNumber {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$hostName
+    )
+
+    try {
+        $buildInfo = Invoke-Command -ComputerName $hostName -ScriptBlock {
+            $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+            $regInfo = Get-ItemProperty -Path $regPath
+            $fullBuildString = "$($regInfo.CurrentBuild).$($regInfo.UBR)"
+            
+            "Windows Build Number: $fullBuildString"
+        } -ErrorAction Stop
+        
+        Write-Output $buildInfo
+
+    } catch {
+        Write-Error "Could not retrieve build number from $hostName. Error: $($_.Exception.Message)"
     }
 }
 
@@ -465,7 +489,7 @@ function ProcessLoadedProfiles {
 
             try {
                 $adUser = Get-ADUser -Identity $lastUser -Properties *
-                Write-Host " $($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
+                Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
             } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                 Write-Warning "Using a local account or inactive AD account"
             } catch {
@@ -509,7 +533,7 @@ function ProcessHost {
                     $whoLoggedIn = $whoLoggedIn -replace ".*\\"
                     try {
                         $adUser = Get-ADUser -Identity $whoLoggedIn -Properties *
-                        Write-Host " $($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
+                        Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
                     } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                         Write-Warning "User is not an AD user account"
                     }
@@ -519,6 +543,7 @@ function ProcessHost {
                 
                 # Retrieve additional information
                 GetDiskSpace -hostName $hostName
+                GetWindowsBuildNumber -hostName $hostName
                 GetSerialNumber -hostName $hostName
                 GetBootTime -hostName $hostName
             }
