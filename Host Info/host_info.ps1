@@ -1,9 +1,9 @@
 ﻿# Script version
-$scriptVersion = "3.6a"
+$scriptVersion = "3.7"
 
 # Script to read a host name from user
 # Output to screen if PC online, Login details, IP address, OS used and Diskspace, S/N
-# AP 22/2/16
+# v1    - AP 22/2/16
 # v2.1  - added functions, blank hostname input an exit command. Display description and service pack if exists in AD object
 # v2.2  - added more functions and reduced size of code for disk space display. Added checks for access denied to hosts
 # v2.3  - display different format for where host is in the AD structure
@@ -29,6 +29,7 @@ $scriptVersion = "3.6a"
 # v3.4  - 13/01/2024 - Copilot suggested optimisations: Reduce redundant calls, improve error handling to be more specific and informative, group related options into try and catch, simplified logic checking for $userProfiles.
 # v3.5  - 16/01/2024 - Modularised ProcessHost, added parameter validation, improved error handing, added comments to code.
 # v3.6  - 22/09/2025 - Include OS Build Number in output (remote reg query)
+# v3.7  - 06/11/2025 - Improved "Press Enter to continue" prompt to accept a hostname
 
 # Import the SCCM module
 Import-Module 'C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1'
@@ -42,9 +43,12 @@ Clear-Host
 # Function to pause the script
 function Pause {
     param (
-        [string]$Message = "Press Enter to continue ... "  # Default message to display
+        # Tweak: Change the default prompt to accept a hostname or Enter
+        #[string]$Message = "Press Enter to return to main prompt, or enter the next Hostname/IP to process immediately"
+        [string]$Message = "Press Enter to continue... "
     )
-    Read-Host -Prompt $Message  # Pause and wait for user input
+    # Read-Host returns the input string (which can be empty if only Enter is pressed)
+    return Read-Host -Prompt $Message # Pause and wait for user input, returning the result
 }
 
 # Get the last logged in date for a computer
@@ -559,14 +563,38 @@ function ProcessHost {
 
 # MAIN SCRIPT BODY #
 do {
-    Clear-Host
+    # *** REMOVED Clear-Host from here ***
     $hostName = Read-Host 'Hostname/IP? (exit to quit)'
+
     if ($hostName -eq "exit") {
-        break  # Use break instead of exit for better script control
+        break # Exit main loop
     }
+ 
     if ($hostName -ne "") {
+        # *** ADDED Clear-Host here: Clears screen only if we have a host to process ***
+        Clear-Host 
         Write-Host "Script version $scriptVersion"
         ProcessHost -hostName $hostName
-        Pause
-    }
-} while ($hostName -ne "exit")
+
+        # --- New Chained Processing Block ---
+        $tempHostName = ""
+        do {
+            # Capture next action (can be empty, 'exit', or a hostname)
+            $nextAction = Pause 
+            $tempHostName = $nextAction.Trim()
+
+            f ($tempHostName -eq "exit") {
+                break 2 # Exit both inner (do) and outer (do) loop
+            }
+
+            if ($tempHostName -ne "") {
+                # *** ADDED Clear-Host here: Clears screen before processing chained host ***
+                Clear-Host
+                #Write-Host "`n--- Processing chained host: $tempHostName ---"
+                Write-Host "Script version $scriptVersion"
+                ProcessHost -hostName $tempHostName
+            }
+        } while ($tempHostName -ne "")
+        # --- End Chained Processing Block ---
+    } # This closes the initial 'if ($hostName -ne "")' block
+} while ($true)
