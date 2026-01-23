@@ -3,7 +3,7 @@ $scriptVersion = "3.7"
 
 # Script to read a host name from user
 # Output to screen if PC online, Login details, IP address, OS used and Diskspace, S/N
-# v1    - AP 22/2/16
+# AP 22/2/16
 # v2.1  - added functions, blank hostname input an exit command. Display description and service pack if exists in AD object
 # v2.2  - added more functions and reduced size of code for disk space display. Added checks for access denied to hosts
 # v2.3  - display different format for where host is in the AD structure
@@ -29,10 +29,29 @@ $scriptVersion = "3.7"
 # v3.4  - 13/01/2024 - Copilot suggested optimisations: Reduce redundant calls, improve error handling to be more specific and informative, group related options into try and catch, simplified logic checking for $userProfiles.
 # v3.5  - 16/01/2024 - Modularised ProcessHost, added parameter validation, improved error handing, added comments to code.
 # v3.6  - 22/09/2025 - Include OS Build Number in output (remote reg query)
-# v3.7  - 06/11/2025 - Improved "Press Enter to continue" prompt to accept a hostname
+# v3.7  - 23/01/2026 - Integrated Get-ComputerOwner logic for AD Object Owner display
+#                    - Refactored function names to standard Verb-Noun syntax
+#                    - Removed unused GetLastLoggedIn function and undefined variables
+#                    - Soft-coded SCCM module import for better compatibility
+#                    - Standardised user information display formatting with Get-FormattedUserDetails
+#                    - Modernised script documentation with Comment-Based Help and cleaned up redundant comments
 
 # Import the SCCM module
-Import-Module 'C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1'
+$sccmModulePaths = @(
+    "C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1",
+    "D:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1"
+)
+$sccmLoaded = $false
+foreach ($path in $sccmModulePaths) {
+    if (Test-Path $path) {
+        Import-Module $path
+        $sccmLoaded = $true
+        break
+    }
+}
+if (-not $sccmLoaded) {
+    Write-Warning "SCCM ConfigurationManager module not found in standard locations."
+}
 
 # Connect to the SCCM site
 Set-Location "UN2:"
@@ -40,67 +59,77 @@ Set-Location "UN2:"
 # Clear PS Window
 Clear-Host
 
-# Function to pause the script
-function Pause {
+function Invoke-Pause {
+    <#
+    .SYNOPSIS
+        Pauses the script and waits for user input.
+    .PARAMETER Message
+        The message to display to the user.
+    #>
     param (
-        # Tweak: Change the default prompt to accept a hostname or Enter
-        #[string]$Message = "Press Enter to return to main prompt, or enter the next Hostname/IP to process immediately"
         [string]$Message = "Press Enter to continue... "
     )
-    # Read-Host returns the input string (which can be empty if only Enter is pressed)
-    return Read-Host -Prompt $Message # Pause and wait for user input, returning the result
+    Read-Host -Prompt $Message
 }
 
-# Get the last logged in date for a computer
-function GetLastLoggedIn {
-    param (
-        [Parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
-    )
-    # Retrieve and display the last logon date of the computer from Active Directory
-    Get-ADComputer -Identity $hostName -Properties * | Format-Table LastLogonDate -Autosize -SearchBase $ou
-}
 
-# Get the primary user of a device from SCCM
-function GetSCCMPrimaryUser {
+
+function Get-SCCMPrimaryUser {
+    <#
+    .SYNOPSIS
+        Retrieves the primary user of a device from SCCM.
+    .PARAMETER deviceName
+        The name of the device in SCCM.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$deviceName  # Device name in SCCM
+        [string]$deviceName
     )
     # Retrieve the primary user of the device from SCCM
     $primaryUser = Get-CMUserDeviceAffinity -DeviceName $deviceName | Select-Object -ExpandProperty UniqueUserName
     if ($primaryUser) {
         Write-Output "$primaryUser"  # Return the primary user if found
-    } else {
+    }
+    else {
         Write-Output "No primary user found"  # Return a message if no primary user is found
     }
 }
 
-# Get the currently logged on user of a device from SCCM
-function GetSCCMCurrentLoggedOnUser {
+function Get-SCCMCurrentLoggedOnUser {
+    <#
+    .SYNOPSIS
+        Retrieves the currently logged on user of a device from SCCM.
+    .PARAMETER deviceName
+        The name of the device in SCCM.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$deviceName  # Device name in SCCM
+        [string]$deviceName
     )
     # Retrieve the currently logged on user of the device from SCCM
     $loggedOnUser = Get-CMDevice -Name $deviceName | Select-Object -ExpandProperty CurrentLogonUser
     if ($loggedOnUser) {
         Write-Output "$loggedOnUser"  # Return the logged on user if found
-    } else {
+    }
+    else {
         Write-Output "No user currently logged on"  # Return a message if no user is currently logged on
     }
 }
 
-# Get the logged in user of a computer
-function GetLoggedInUser {
+function Get-LoggedInUser {
+    <#
+    .SYNOPSIS
+        Retrieves the currently logged in user from a remote computer.
+    .PARAMETER ComputerName
+        The name(s) of the computer(s) to query.
+    #>
     [CmdletBinding()]
     param (
         [Parameter(ValueFromPipelineByPropertyName, ValueFromPipeline)]
-        [Alias("CN","Name","MachineName")]
-        [string[]]$ComputerName = $ENV:ComputerName  # Computer name(s) to check
+        [Alias("CN", "Name", "MachineName")]
+        [string[]]$ComputerName = $ENV:ComputerName
     )
     process {
         foreach ($computer in $ComputerName) {
@@ -111,23 +140,25 @@ function GetLoggedInUser {
                     $whoLoggedIn = Get-CimInstance -ComputerName $computer -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty UserName
                     if (!$whoLoggedIn) {
                         Write-Warning "No users logged into $computer"
-                    } else {
+                    }
+                    else {
                         # Return the logged in user information as a custom object
                         [PSCustomObject]@{
-                            PSTypeName = "AdminTools.LoggedInUser"
-                            ComputerName = $computer
-                            UserName = $whoLoggedIn
-                            SessionName = "N/A"
-                            SessionId = "N/A"
-                            State = "Active"
-                            IdleTime = "N/A"
-                            LogonTime = "N/A"
+                            PSTypeName        = "AdminTools.LoggedInUser"
+                            ComputerName      = $computer
+                            UserName          = $whoLoggedIn
+                            SessionName       = "N/A"
+                            SessionId         = "N/A"
+                            State             = "Active"
+                            IdleTime          = "N/A"
+                            LogonTime         = "N/A"
                             LockScreenPresent = $false
-                            LockScreenTimer = (New-TimeSpan)
-                            SessionType = "N/A"
+                            LockScreenTimer   = (New-TimeSpan)
+                            SessionType       = "N/A"
                         }
                     }
-                } else {
+                }
+                else {
                     # Handle unreachable computer
                     $ErrorRecord = [System.Management.Automation.ErrorRecord]::new(
                         [System.Net.NetworkInformation.PingException]::new("$computer is unreachable"),
@@ -137,17 +168,21 @@ function GetLoggedInUser {
                     )
                     $PSCmdlet.WriteError($ErrorRecord)
                 }
-            } catch [System.Management.Automation.RemoteException] {
+            }
+            catch [System.Management.Automation.RemoteException] {
                 if ($_.Exception.Message -like "*The RPC server is unavailable*") {
                     Write-Warning "WMI query failed on $computer. Ensure 'Netlogon Service (NP-In)' firewall rule is enabled"
                     $PSCmdlet.WriteError($_)
-                } else {
+                }
+                else {
                     $PSCmdlet.WriteError($_)
                 }
-            } catch [System.Runtime.InteropServices.COMException] {
+            }
+            catch [System.Runtime.InteropServices.COMException] {
                 Write-Warning "WMI query failed on $computer. Ensure 'Windows Management Instrumentation (WMI-In)' firewall rule is enabled."
                 $PSCmdlet.WriteError($_)
-            } catch {
+            }
+            catch {
                 Write-Information "Unexpected error occurred with $computer"
                 $PSCmdlet.WriteError($_)
             }
@@ -155,12 +190,17 @@ function GetLoggedInUser {
     }
 }
 
-# Get the serial number and model information of a computer
-function GetSerialNumber {
+function Get-SerialNumber {
+    <#
+    .SYNOPSIS
+        Retrieves the serial number, make, and model information of a computer.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     $PCtype = [int]
     # Retrieve BIOS, computer system, and computer system product information
@@ -169,15 +209,15 @@ function GetSerialNumber {
     $model2 = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ComputerName $hostName
     $PCtype = $model.PCSystemType
     $PCSystemType_ReturnValue = @{
-        0='Unspecified'
-        1='Desktop'
-        2='Laptop'
-        3='Workstation'
-        4='Enterprise Server'
-        5='SOHO Server'
-        6='Appliance PC'
-        7='Performance Server'
-        8='Maximum'
+        0 = 'Unspecified'
+        1 = 'Desktop'
+        2 = 'Laptop'
+        3 = 'Workstation'
+        4 = 'Enterprise Server'
+        5 = 'SOHO Server'
+        6 = 'Appliance PC'
+        7 = 'Performance Server'
+        8 = 'Maximum'
     }
     [int]$PCtype = $PCtype
     $PCtype2 = $PCSystemType_ReturnValue.item($PCtype)
@@ -186,18 +226,24 @@ function GetSerialNumber {
     # Display model and serial number information
     if ($sn.Manufacturer -eq "LENOVO") {
         Write-Host "Model: " $model2.Vendor $model2.Version $PCtype2
-    } else {
+    }
+    else {
         Write-Host "Model: " $model.Manufacturer $model.Model $PCtype2
     }
     Write-Host "Serial Number: " $sn.SerialNumber
 }
 
-# Get the boot time information of a computer
-function GetBootTime {
+function Get-BootTime {
+    <#
+    .SYNOPSIS
+        Retrieves the installation date and last boot time of a computer.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
         # Retrieve boot time information
@@ -208,34 +254,48 @@ function GetBootTime {
         Write-Host "Install Date: " $installDate
         Write-Host "Last Boot Time: " $lastBootUpTime
         Write-Host ""
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve boot time information for $hostName"
     }
 }
 
-# Get the disk space information of a computer
-function GetDiskSpace {
+function Get-DiskSpace {
+    <#
+    .SYNOPSIS
+        Retrieves the disk space information for the C: drive of a computer.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
         # Retrieve disk space information
-        $disk = Get-CimInstance -ClassName Win32_LogicalDisk -ComputerName $hostName -Filter "DeviceID='C:'" | Select-Object Size,FreeSpace
+        $disk = Get-CimInstance -ClassName Win32_LogicalDisk -ComputerName $hostName -Filter "DeviceID='C:'" | Select-Object Size, FreeSpace
         # Display disk size and free space
         if ([math]::round($disk.FreeSpace / 1GB) -lt 1) {
             Write-Host -NoNewLine "Disk Size on C: " ([math]::round($disk.Size / 1GB)) "GB" "- Free Disk Space on C: "
             Write-Host -ForegroundColor "red" ([math]::round($disk.FreeSpace / 1MB)) "MB"
-        } else {
+        }
+        else {
             Write-Host "Disk Size on C: " ([math]::round($disk.Size / 1GB)) "GB" "- Free Disk Space on C: " ([math]::round($disk.FreeSpace / 1GB, 1)) "GB"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve disk space information for $hostName"
     }
 }
 
-function GetWindowsBuildNumber {
+function Get-WindowsBuildNumber {
+    <#
+    .SYNOPSIS
+        Retrieves the Windows build number from a remote computer via registry.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -253,30 +313,48 @@ function GetWindowsBuildNumber {
         
         Write-Output $buildInfo
 
-    } catch {
+    }
+    catch {
         Write-Error "Could not retrieve build number from $hostName. Error: $($_.Exception.Message)"
     }
 }
 
-# Get Active Directory information of a computer
-function GetADInfo {
+function Get-ADInfo {
+    <#
+    .SYNOPSIS
+        Retrieves Active Directory information for a computer object.
+    .PARAMETER hostName
+        The hostname of the computer to query in AD.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
         # Retrieve AD information
         $ad_loc = (Get-ADComputer $hostName).DistinguishedName
         $ad_loc = $ad_loc -replace ",DC.*"
         $info = Get-ADComputer -Identity $hostName -Properties *
+        
         # Display AD information
         Write-Host $info.CanonicalName $info.IPv4Address
+
+        # Get AD Object Owner
+        try {
+            $acl = Get-Acl -Path "AD:$($info.DistinguishedName)" -ErrorAction Stop
+            $owner = $acl.Owner
+            Write-Host "AD Object Owner: $owner"
+        }
+        catch {
+            Write-Host "AD Object Owner: Permission Denied or Error"
+        }
         Write-Host "Last login Date: " $info.LastLogonDate
         Write-Host -NoNewLine "Operating System installed: " $info.OperatingSystem $info.OperatingSystemVersion
         if ([string]::IsNullOrWhiteSpace($info.OperatingSystemServicePack)) {
             Write-Host ""
-        } else {
+        }
+        else {
             Write-Host " " $info.OperatingSystemServicePack
             Write-Host ""
         }
@@ -285,33 +363,40 @@ function GetADInfo {
             Write-Host ""
         }
         # Retrieve and display SCCM primary and current user information
-        $primaryUser = GetSCCMPrimaryUser -deviceName $hostName
+        $primaryUser = Get-SCCMPrimaryUser -deviceName $hostName
         Write-Host "SCCM Primary User(s): $primaryUser"
-        $currentUser = GetSCCMCurrentLoggedOnUser -deviceName $hostName
+        $currentUser = Get-SCCMCurrentLoggedOnUser -deviceName $hostName
         Write-Host "SCCM Current User: $currentUser"
         Write-Host ""
         # Check and display patch group information if applicable
         if ($ad_loc -NotMatch "OU=Workstations") {
-            CheckPatchGroup -hostName $hostName
+            Get-PatchGroup -hostName $hostName
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve AD information for $hostName"
     }
 }
 
-# Check the patch group of a computer
-function CheckPatchGroup {
+function Get-PatchGroup {
+    <#
+    .SYNOPSIS
+        Checks which AD patch groups a computer belongs to.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
         # Retrieve patch group information
         $Groups = (Get-ADComputer -Identity $hostName -Properties *).MemberOf
         if ([string]::IsNullOrWhiteSpace($Groups)) {
             Write-Host "Not in any Patch groups"
-        } else {
+        }
+        else {
             $Groups | ForEach-Object {
                 $groupName = $_.Split(",").Split("=")
                 if ($groupName -match "SRV-") {
@@ -319,37 +404,50 @@ function CheckPatchGroup {
                 }
             }
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve patch group information for $hostName"
     }
 }
 
-# Check if the computer is in Active Directory and get its information
-function CheckInAD {
+function Test-ComputerADStatus {
+    <#
+    .SYNOPSIS
+        Checks if a computer exists in AD and retrieves its information.
+    .PARAMETER hostName
+        The hostname of the computer to check.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
-        GetADInfo -hostName $hostName
-    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+        Get-ADInfo -hostName $hostName
+    }
+    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
         Write-Warning "AD computer object not found"
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to check AD information for $hostName"
     }
 }
 
-# Get the last user who logged into the computer
-function GetLastUser {
+function Get-LastUser {
+    <#
+    .SYNOPSIS
+        Identifies the last user to log into the computer.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$hostName  # Hostname of the computer
+        [string]$hostName
     )
     try {
         $currentUser = $null
-        $loggedInUsers = GetLoggedInUser -ComputerName $hostName
+        $loggedInUsers = Get-LoggedInUser -ComputerName $hostName
         if ($loggedInUsers) {
             $currentUser = $loggedInUsers | Select-Object -First 1
             $currentUserName = $currentUser.UserName
@@ -358,18 +456,21 @@ function GetLastUser {
             try {
                 # Retrieve and display current user details from AD
                 $currentUserDetails = Get-ADUser -Identity $currentUserName -Properties GivenName, Surname, Department -ErrorAction Ignore
-                Write-Host "Current logged on user: $currentUserName       $($currentUserDetails.GivenName) $($currentUserDetails.Surname)       $($currentUserDetails.Department)" -ForegroundColor Red
+                $formattedDetails = Get-FormattedUserDetails -ADUser $currentUserDetails
+                Write-Host "Current logged on user: $currentUserName       $formattedDetails" -ForegroundColor Red
                 Write-Host "Logon time: $ukDateFormat" -ForegroundColor Red
-            } catch {
+            }
+            catch {
                 Write-Warning "Error occurred while retrieving current user details from Active Directory."
             }
-        } else {
+        }
+        else {
             # Retrieve and display last user profile information
             $userProfiles = Get-CimInstance -ClassName Win32_UserProfile -ComputerName $hostName -Filter "Special='False'" | 
-                            Select-Object @{Name='UserName';Expression={Split-Path $_.LocalPath -Leaf}}, 
-                                          Loaded, 
-                                          @{Name='LastUseTime';Expression={if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null }}} | 
-                            Sort-Object LastUseTime -Descending
+            Select-Object @{Name = 'UserName'; Expression = { Split-Path $_.LocalPath -Leaf } }, 
+            Loaded, 
+            @{Name = 'LastUseTime'; Expression = { if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null } } } | 
+            Sort-Object LastUseTime -Descending
             if ($userProfiles) {
                 $lastUser = $userProfiles.UserName
                 Write-Host -NoNewline "Last logged in by " $userProfiles.UserName $userProfiles.LastUseTime[0] -ForegroundColor "red" " "
@@ -377,42 +478,88 @@ function GetLastUser {
                 # Enhanced validation for $lastUser before calling Get-ADUser
                 if ($lastUser -match '^[a-zA-Z0-9][a-zA-Z0-9._-]{2,}$') {
                     try {
-                        RetrieveAndDisplayADUserDetails -UserName $lastUser
-                    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+                        Show-ADUserDetails -UserName $lastUser
+                    }
+                    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                         Write-Warning "Using a local account or inactive AD account"
                     }
-                } else {
+                }
+                else {
                     Write-Warning "Invalid username detected: $lastUser"
                 }
-            } else {
+            }
+            else {
                 Write-Warning "No user profiles found on $hostName"
             }
         }
         Write-Host ""
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve last user information for $hostName"
     }
 }
 
-# Helper function to retrieve and display AD user details
-function RetrieveAndDisplayADUserDetails {
+function Show-ADUserDetails {
+    <#
+    .SYNOPSIS
+        Retrieves and displays details for an AD user.
+    .PARAMETER UserName
+        The username of the user to query.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
-        [string]$UserName  # Username to retrieve details for
+        [Parameter(Mandatory = $true)]
+        [string]$UserName
     )
     try {
         # Retrieve and display AD user details
         $adUser = Get-ADUser -Identity $UserName -Properties GivenName, Surname, Department -ErrorAction Ignore
         if ($adUser) {
-            Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
+            $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
+            Write-Host $formattedDetails -ForegroundColor "red"
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Failed to retrieve AD user details for $UserName"
     }
 }
 
-# Function to retrieve host information
+function Get-FormattedUserDetails {
+    <#
+    .SYNOPSIS
+        Formats AD user properties into a clean display string.
+    .PARAMETER ADUser
+        The AD user object to format.
+    #>
+    param (
+        [Parameter(Mandatory = $true)]
+        $ADUser
+    )
+    $nameParts = @()
+    if ($ADUser.GivenName) { $nameParts += $ADUser.GivenName }
+    if ($ADUser.Surname) { $nameParts += $ADUser.Surname }
+    
+    $fullName = $nameParts -join " "
+    $details = $fullName
+    
+    if ($ADUser.Department) {
+        if ($details) {
+            $details += " - $($ADUser.Department)"
+        }
+        else {
+            $details = $ADUser.Department
+        }
+    }
+    
+    return $details
+}
+
 function Get-HostInfo {
+    <#
+    .SYNOPSIS
+        Retrieves basic OS and network information from a remote computer.
+    .PARAMETER hostName
+        The hostname of the computer to query.
+    #>
     param (
         [string]$hostName
     )
@@ -427,23 +574,31 @@ function Get-HostInfo {
         # Retrieve logged in user and loaded profiles
         $whoLoggedIn = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $hostName | Select-Object -ExpandProperty UserName
         $loadedProfiles = Get-CimInstance -ClassName Win32_UserProfile -ComputerName $hostName -Filter "Special='False' AND Loaded='True'" | 
-                          Select-Object @{Name='UserName';Expression={Split-Path $_.LocalPath -Leaf}}, 
-                                        Loaded, 
-                                        @{Name='LastUseTime';Expression={if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null }}}
+        Select-Object @{Name = 'UserName'; Expression = { Split-Path $_.LocalPath -Leaf } }, 
+        Loaded, 
+        @{Name = 'LastUseTime'; Expression = { if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null } } }
         
         # Return the retrieved information
         return @{
-            WhoLoggedIn = $whoLoggedIn
+            WhoLoggedIn    = $whoLoggedIn
             LoadedProfiles = $loadedProfiles
         }
-    } else {
+    }
+    else {
         Write-Warning "Failed to retrieve OS information for $hostName"
         return $null
     }
 }
 
-# Function to process loaded profiles
-function ProcessLoadedProfiles {
+function Show-LoadedProfiles {
+    <#
+    .SYNOPSIS
+        Processes and displays details about currently loaded user profiles.
+    .PARAMETER loadedProfiles
+        The array of loaded profile objects.
+    .PARAMETER hostName
+        The hostname of the computer.
+    #>
     param (
         [array]$loadedProfiles,
         [string]$hostName
@@ -455,12 +610,12 @@ function ProcessLoadedProfiles {
         $sessions = Invoke-Command -ComputerName $hostName -ScriptBlock { quser } | Select-String -Pattern "(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)" | ForEach-Object {
             $sessionMatches = [regex]::Matches($_, "(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)")
             [PSCustomObject]@{
-                UserName = $sessionMatches[0].Groups[1].Value
+                UserName    = $sessionMatches[0].Groups[1].Value
                 SessionName = $sessionMatches[0].Groups[2].Value
-                ID = $sessionMatches[0].Groups[3].Value
-                State = $sessionMatches[0].Groups[4].Value
-                IdleTime = $sessionMatches[0].Groups[5].Value
-                LogonTime = $sessionMatches[0].Groups[6].Value
+                ID          = $sessionMatches[0].Groups[3].Value
+                State       = $sessionMatches[0].Groups[4].Value
+                IdleTime    = $sessionMatches[0].Groups[5].Value
+                LogonTime   = $sessionMatches[0].Groups[6].Value
             }
         }
         
@@ -473,43 +628,54 @@ function ProcessLoadedProfiles {
             if ($session) {
                 $state = $session.State
                 Write-Host "User: $userName, Last Use Time: $lastUseTime, State: $state" -ForegroundColor "yellow"
-            } else {
+            }
+            else {
                 Write-Host "User: $userName, Last Use Time: $lastUseTime, State: Unknown" -ForegroundColor "yellow"
             }
         }
         Write-Host ""
-    } else {
+    }
+    else {
         Write-Warning "No current login details."
         # Retrieve user profiles
         $userProfiles = Get-CimInstance -ClassName Win32_UserProfile -ComputerName $hostName -Filter "Special='False'" | 
-                        Select-Object @{Name='UserName';Expression={Split-Path $_.LocalPath -Leaf}}, 
-                                      Loaded, 
-                                      @{Name='LastUseTime';Expression={if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null }}} | 
-                        Sort-Object LastUseTime -Descending
+        Select-Object @{Name = 'UserName'; Expression = { Split-Path $_.LocalPath -Leaf } }, 
+        Loaded, 
+        @{Name = 'LastUseTime'; Expression = { if ($_.LastUseTime) { Get-Date $_.LastUseTime } else { $null } } } | 
+        Sort-Object LastUseTime -Descending
         if ($userProfiles) {
             # Handle single or multiple user profiles
             $lastUser = if ($userProfiles -is [array]) { $userProfiles.UserName[0] } else { $userProfiles.UserName }
             Write-Host -NoNewline "Last logged in by $lastUser $($userProfiles.LastUseTime[0])" -ForegroundColor "red"
 
             try {
-                $adUser = Get-ADUser -Identity $lastUser -Properties *
-                Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
-            } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+                $adUser = Get-ADUser -Identity $lastUser -Properties GivenName, Surname, Department
+                $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
+                Write-Host $formattedDetails -ForegroundColor "red"
+            }
+            catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                 Write-Warning "Using a local account or inactive AD account"
-            } catch {
+            }
+            catch {
                 Write-Warning "Error occurred while retrieving AD user details: $_"
             }
-        } else {
+        }
+        else {
             Write-Warning "No user profiles found on $hostName"
         }
         Write-Host ""
     }
 }
 
-# Main function to process the host
-function ProcessHost {
+function Invoke-HostProcessing {
+    <#
+    .SYNOPSIS
+        The main processing engine for a single host.
+    .PARAMETER hostName
+        The hostname or IP address to process.
+    #>
     param (
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$hostName
     )
@@ -524,7 +690,7 @@ function ProcessHost {
 
     if ($isReachable) {
         Write-Host -NoNewline "$hostName is online and "
-        CheckInAD -hostName $hostName
+        Test-ComputerADStatus -hostName $hostName
         try {
             # Retrieve host information
             $hostInfo = Get-HostInfo -hostName $hostName
@@ -536,25 +702,30 @@ function ProcessHost {
                     Write-Host "Currently logged in by: $whoLoggedIn" -ForegroundColor "red"
                     $whoLoggedIn = $whoLoggedIn -replace ".*\\"
                     try {
-                        $adUser = Get-ADUser -Identity $whoLoggedIn -Properties *
-                        Write-Host "$($adUser.GivenName) $($adUser.Surname) - $($adUser.Department)" -ForegroundColor "red"
-                    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+                        $adUser = Get-ADUser -Identity $whoLoggedIn -Properties GivenName, Surname, Department
+                        $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
+                        Write-Host $formattedDetails -ForegroundColor "red"
+                    }
+                    catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                         Write-Warning "User is not an AD user account"
                     }
-                } else {
-                    ProcessLoadedProfiles -loadedProfiles $loadedProfiles -hostName $hostName
+                }
+                else {
+                    Show-LoadedProfiles -loadedProfiles $loadedProfiles -hostName $hostName
                 }
                 
                 # Retrieve additional information
-                GetDiskSpace -hostName $hostName
-                GetWindowsBuildNumber -hostName $hostName
-                GetSerialNumber -hostName $hostName
-                GetBootTime -hostName $hostName
+                Get-DiskSpace -hostName $hostName
+                Get-WindowsBuildNumber -hostName $hostName
+                Get-SerialNumber -hostName $hostName
+                Get-BootTime -hostName $hostName
             }
-        } catch {
+        }
+        catch {
             Write-Warning "Error occurred while processing $hostName - $_"
         }
-    } else {
+    }
+    else {
         Write-Warning "$hostName is not reachable"
         # Continue processing AD information even if the host is unreachable
         CheckInAD -hostName $hostName
@@ -563,38 +734,14 @@ function ProcessHost {
 
 # MAIN SCRIPT BODY #
 do {
-    # *** REMOVED Clear-Host from here ***
+    Clear-Host
     $hostName = Read-Host 'Hostname/IP? (exit to quit)'
-
     if ($hostName -eq "exit") {
-        break # Exit main loop
+        break  # Use break instead of exit for better script control
     }
- 
     if ($hostName -ne "") {
-        # *** ADDED Clear-Host here: Clears screen only if we have a host to process ***
-        Clear-Host 
         Write-Host "Script version $scriptVersion"
-        ProcessHost -hostName $hostName
-
-        # --- New Chained Processing Block ---
-        $tempHostName = ""
-        do {
-            # Capture next action (can be empty, 'exit', or a hostname)
-            $nextAction = Pause 
-            $tempHostName = $nextAction.Trim()
-
-            f ($tempHostName -eq "exit") {
-                break 2 # Exit both inner (do) and outer (do) loop
-            }
-
-            if ($tempHostName -ne "") {
-                # *** ADDED Clear-Host here: Clears screen before processing chained host ***
-                Clear-Host
-                #Write-Host "`n--- Processing chained host: $tempHostName ---"
-                Write-Host "Script version $scriptVersion"
-                ProcessHost -hostName $tempHostName
-            }
-        } while ($tempHostName -ne "")
-        # --- End Chained Processing Block ---
-    } # This closes the initial 'if ($hostName -ne "")' block
-} while ($true)
+        Invoke-HostProcessing -hostName $hostName
+        Invoke-Pause
+    }
+} while ($hostName -ne "exit")
