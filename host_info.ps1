@@ -1,5 +1,5 @@
 ﻿# Script version
-$scriptVersion = "3.7"
+$scriptVersion = "3.9"
 
 # Script to read a host name from user
 # Output to screen if PC online, Login details, IP address, OS used and Diskspace, S/N
@@ -35,6 +35,8 @@ $scriptVersion = "3.7"
 #                    - Soft-coded SCCM module import for better compatibility
 #                    - Standardised user information display formatting with Get-FormattedUserDetails
 #                    - Modernised script documentation with Comment-Based Help and cleaned up redundant comments
+#                    - Added whitelist for specific accounts to be always green (AD\cczrembo, AD\Service_Rembo)
+#                    - Renamed $profile loop variable to $profileObj to avoid conflict with automatic variable
 
 # Import the SCCM module
 $sccmModulePaths = @(
@@ -319,6 +321,37 @@ function Get-WindowsBuildNumber {
     }
 }
 
+function Test-ADGroupMemberRecursive {
+    <#
+    .SYNOPSIS
+        Checks if an AD object (user or group) is a member of a group, either directly or recursively.
+    .PARAMETER Identity
+        The identity of the AD object to check.
+    .PARAMETER GroupName
+        The name of the target group.
+    #>
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Identity,
+        [Parameter(Mandatory = $true)]
+        [string]$GroupName
+    )
+    try {
+        $object = Get-ADObject -Identity $Identity -ErrorAction Stop
+        $group = Get-ADGroup -Identity $GroupName -ErrorAction Stop
+        
+        $ldapFilter = "(distinguishedName=$($object.DistinguishedName))"
+        $memberOfFilter = "(memberof:1.2.840.113556.1.4.1941:=$($group.DistinguishedName))"
+        $finalFilter = "(&$ldapFilter$memberOfFilter)"
+        
+        $result = Get-ADObject -LDAPFilter $finalFilter -ErrorAction SilentlyContinue
+        return [bool]$result
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-ADInfo {
     <#
     .SYNOPSIS
@@ -340,11 +373,20 @@ function Get-ADInfo {
         # Display AD information
         Write-Host $info.CanonicalName $info.IPv4Address
 
-        # Get AD Object Owner
+        # Get AD Object Owner and check membership
         try {
             $acl = Get-Acl -Path "AD:$($info.DistinguishedName)" -ErrorAction Stop
-            $owner = $acl.Owner
-            Write-Host "AD Object Owner: $owner"
+            $ownerIdentity = $acl.Owner
+            
+            # Whitelist for specific accounts to be always green
+            $ownerWhitelist = @("AD\cczrembo", "AD\Service_Rembo")
+            
+            $isWhitelisted = $ownerWhitelist -contains $ownerIdentity
+            $isLocalAdmin = if ($isWhitelisted) { $true } else { Test-ADGroupMemberRecursive -Identity $ownerIdentity -GroupName "PCs_DL_LocalAdmin" }
+            
+            $ownerColor = if ($isLocalAdmin) { "Green" } else { "Red" }
+            Write-Host -NoNewline "AD Object Owner: "
+            Write-Host $ownerIdentity -ForegroundColor $ownerColor
         }
         catch {
             Write-Host "AD Object Owner: Permission Denied or Error"
@@ -620,9 +662,9 @@ function Show-LoadedProfiles {
         }
         
         # Process each loaded profile
-        foreach ($profile in $loadedProfiles) {
-            $userName = $profile.UserName
-            $lastUseTime = $profile.LastUseTime
+        foreach ($profileObj in $loadedProfiles) {
+            $userName = $profileObj.UserName
+            $lastUseTime = $profileObj.LastUseTime
             $session = $sessions | Where-Object { $_.UserName -eq $userName }
             
             if ($session) {
