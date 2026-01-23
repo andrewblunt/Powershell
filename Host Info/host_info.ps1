@@ -37,6 +37,7 @@ $scriptVersion = "3.9"
 #                    - Modernised script documentation with Comment-Based Help and cleaned up redundant comments
 #                    - Added whitelist for specific accounts to be always green (AD\cczrembo, AD\Service_Rembo)
 #                    - Renamed $profile loop variable to $profileObj to avoid conflict with automatic variable
+#                    - Updated highlight colour of current logged on user to cyan
 
 # Import the SCCM module
 $sccmModulePaths = @(
@@ -499,8 +500,8 @@ function Get-LastUser {
                 # Retrieve and display current user details from AD
                 $currentUserDetails = Get-ADUser -Identity $currentUserName -Properties GivenName, Surname, Department -ErrorAction Ignore
                 $formattedDetails = Get-FormattedUserDetails -ADUser $currentUserDetails
-                Write-Host "Current logged on user: $currentUserName       $formattedDetails" -ForegroundColor Red
-                Write-Host "Logon time: $ukDateFormat" -ForegroundColor Red
+                Write-Host "Current logged on user: $currentUserName       $formattedDetails" -ForegroundColor Cyan
+                Write-Host "Logon time: $ukDateFormat" -ForegroundColor Cyan
             }
             catch {
                 Write-Warning "Error occurred while retrieving current user details from Active Directory."
@@ -515,7 +516,7 @@ function Get-LastUser {
             Sort-Object LastUseTime -Descending
             if ($userProfiles) {
                 $lastUser = $userProfiles.UserName
-                Write-Host -NoNewline "Last logged in by " $userProfiles.UserName $userProfiles.LastUseTime[0] -ForegroundColor "red" " "
+                Write-Host -NoNewline "Last logged in by " $userProfiles.UserName $userProfiles.LastUseTime[0] -ForegroundColor "Cyan" " "
 
                 # Enhanced validation for $lastUser before calling Get-ADUser
                 if ($lastUser -match '^[a-zA-Z0-9][a-zA-Z0-9._-]{2,}$') {
@@ -557,7 +558,7 @@ function Show-ADUserDetails {
         $adUser = Get-ADUser -Identity $UserName -Properties GivenName, Surname, Department -ErrorAction Ignore
         if ($adUser) {
             $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
-            Write-Host $formattedDetails -ForegroundColor "red"
+            Write-Host $formattedDetails -ForegroundColor "Cyan"
         }
     }
     catch {
@@ -688,12 +689,12 @@ function Show-LoadedProfiles {
         if ($userProfiles) {
             # Handle single or multiple user profiles
             $lastUser = if ($userProfiles -is [array]) { $userProfiles.UserName[0] } else { $userProfiles.UserName }
-            Write-Host -NoNewline "Last logged in by $lastUser $($userProfiles.LastUseTime[0])" -ForegroundColor "red"
+            Write-Host -NoNewline "Last logged in by $lastUser $($userProfiles.LastUseTime[0])" -ForegroundColor "Cyan"
 
             try {
                 $adUser = Get-ADUser -Identity $lastUser -Properties GivenName, Surname, Department
                 $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
-                Write-Host $formattedDetails -ForegroundColor "red"
+                Write-Host $formattedDetails -ForegroundColor "Cyan"
             }
             catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                 Write-Warning "Using a local account or inactive AD account"
@@ -741,12 +742,12 @@ function Invoke-HostProcessing {
                 $loadedProfiles = $hostInfo.LoadedProfiles
                 
                 if ($whoLoggedIn) {
-                    Write-Host "Currently logged in by: $whoLoggedIn" -ForegroundColor "red"
+                    Write-Host "Currently logged in by: $whoLoggedIn" -ForegroundColor "Cyan"
                     $whoLoggedIn = $whoLoggedIn -replace ".*\\"
                     try {
                         $adUser = Get-ADUser -Identity $whoLoggedIn -Properties GivenName, Surname, Department
                         $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
-                        Write-Host $formattedDetails -ForegroundColor "red"
+                        Write-Host $formattedDetails -ForegroundColor "Cyan"
                     }
                     catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
                         Write-Warning "User is not an AD user account"
