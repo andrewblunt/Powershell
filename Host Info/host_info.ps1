@@ -338,8 +338,20 @@ function Test-ADGroupMemberRecursive {
         [string]$GroupName
     )
     try {
-        $object = Get-ADObject -Identity $Identity -ErrorAction Stop
+        # Clean identity (remove domain prefix if present)
+        $cleanIdentity = $Identity -replace "^[^\\]+\\"
+        
+        # Get the group object
         $group = Get-ADGroup -Identity $GroupName -ErrorAction Stop
+        
+        # Resolve the object (User, Group, or Computer)
+        # We try SamAccountName first as it's the most common for 'Domain\User' format
+        $object = Get-ADObject -Filter "SamAccountName -eq '$cleanIdentity'" -ErrorAction Stop
+        
+        if (-not $object) {
+            # Fallback to direct identity check if filter found nothing (for DNs/SIDs/GUIDs)
+            $object = Get-ADObject -Identity $Identity -ErrorAction Stop
+        }
         
         $ldapFilter = "(distinguishedName=$($object.DistinguishedName))"
         $memberOfFilter = "(memberof:1.2.840.113556.1.4.1941:=$($group.DistinguishedName))"
