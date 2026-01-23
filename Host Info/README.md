@@ -9,9 +9,9 @@ A convenience PowerShell script to query a Windows host for basic inventory and 
 - Serial number, model and chassis type
 - Install date / last reboot
 - SCCM primary user and current user (if SCCM console available)
-- Active Directory location and patch group membership
-
-Version: 3.7 (see script header for full history)
+- AD Object Owner display (with local admin group membership check)
+- Standardized user information display formatting
+- Version: 3.7 (see script header for full history)
 
 ---
 
@@ -39,8 +39,9 @@ After processing a host you can:
 
 - Windows PowerShell (version compatible with CIM/WMI and Invoke-Command)
 - ActiveDirectory PowerShell module (RSAT) available to the running account
-- SCCM Admin Console installed (script imports ConfigurationManager.psd1 at):
-  `C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1`
+- SCCM Admin Console installed (script looks for ConfigurationManager.psd1 in standard locations):
+  - `C:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1`
+  - `D:\Program Files (x86)\Microsoft Configuration Manager\AdminConsole\bin\ConfigurationManager.psd1`
   - Update this path in the script if your console is installed elsewhere.
 - SCCM site PSDrive set in the script with `Set-Location "UN2:"` — change as required for your environment.
 - Network connectivity and remote query permissions to target hosts (CIM/WMI/WinRM).
@@ -120,7 +121,14 @@ License: (none specified) — add a LICENSE file if you want this script to be r
 
 ## Changelog (excerpts from script header)
 
-- v3.7 — 06/11/2025 — Improved "Press Enter to continue" prompt to accept a hostname  
-- v3.6 — 22/09/2025 — Include OS Build Number in output (remote reg query)  
-- v3.5 — 16/01/2024 — Modularised ProcessHost, added parameter validation, improved error handling  
+- v3.7 — 23/01/2026 — Integrated Get-ComputerOwner logic for AD Object Owner display
+  - Refactored function names to standard Verb-Noun syntax
+  - Removed unused GetLastLoggedIn function and undefined variables
+  - Soft-coded SCCM module import for better compatibility
+  - Standardised user information display formatting with Get-FormattedUserDetails
+  - Modernised script documentation with Comment-Based Help
+  - Added whitelist for specific accounts to be always green (AD\cczrembo, AD\Service_Rembo)
+  - Renamed $profile loop variable to $profileObj to avoid conflict with automatic variable
+- v3.6 — 22/09/2025 — Include OS Build Number in output (remote reg query)
+- v3.5 — 16/01/2024 — Modularised ProcessHost, added parameter validation, improved error handling
 - (See `host_info.ps1` header for full history)
