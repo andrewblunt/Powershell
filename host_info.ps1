@@ -728,7 +728,7 @@ function Invoke-HostProcessing {
     else {
         Write-Warning "$hostName is not reachable"
         # Continue processing AD information even if the host is unreachable
-        CheckInAD -hostName $hostName
+        Test-ComputerADStatus -hostName $hostName
     }
 }
 
