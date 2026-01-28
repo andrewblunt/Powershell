@@ -1,5 +1,5 @@
 ﻿# Script version
-$scriptVersion = "3.9"
+$scriptVersion = "3.7"
 
 # Script to read a host name from user
 # Output to screen if PC online, Login details, IP address, OS used and Diskspace, S/N
@@ -701,7 +701,7 @@ function Show-LoadedProfiles {
         if ($userProfiles) {
             # Handle single or multiple user profiles
             $lastUser = if ($userProfiles -is [array]) { $userProfiles.UserName[0] } else { $userProfiles.UserName }
-            Write-Host -NoNewline "Last logged in by $lastUser $($userProfiles.LastUseTime[0])" -ForegroundColor "Cyan"
+            Write-Host -NoNewline "Last logged in by $lastUser $($userProfiles.LastUseTime[0])       " -ForegroundColor "Cyan"
 
             try {
                 $adUser = Get-ADUser -Identity $lastUser -Properties GivenName, Surname, Department
@@ -754,8 +754,8 @@ function Invoke-HostProcessing {
                 $loadedProfiles = $hostInfo.LoadedProfiles
                 
                 if ($whoLoggedIn) {
-                    Write-Host "Currently logged in by: $whoLoggedIn" -ForegroundColor "Cyan"
                     $whoLoggedIn = $whoLoggedIn -replace ".*\\"
+                    Write-Host -NoNewline "Currently logged in by: $whoLoggedIn       " -ForegroundColor "Cyan"
                     try {
                         $adUser = Get-ADUser -Identity $whoLoggedIn -Properties GivenName, Surname, Department
                         $formattedDetails = Get-FormattedUserDetails -ADUser $adUser
