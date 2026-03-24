@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "1.5.3"
+$ScriptRelease = "1.5.4"
 $ScriptBuildDate = "2026-03-24"
 
 # Hash Tables
@@ -1598,6 +1598,7 @@ function Find-LenovoModel {
     .DESCRIPTION
         Downloads the Lenovo SCCM catalog if not present and searches for the model.
         Supports partial/wildcard matching (e.g. "ThinkPad X1" matches "ThinkPad X1 Carbon Gen 9").
+        Returns objects with Name and SKU (machine type) properties.
     .PARAMETER Model
         The model name to search for (e.g. "ThinkPad X1 Carbon Gen 9").
     .EXAMPLE
@@ -1685,9 +1686,15 @@ function Find-LenovoModel {
 
         if ($LenovoModelInfo) {
             Write-LogEntry -Value "- Found $($LenovoModelInfo.Count) matching model(s)" -Severity 1
-            # Return a clean list of model names
-            $Matches = $LenovoModelInfo | Select-Object -ExpandProperty Name -Unique | Sort-Object
-            return $Matches
+            # Return objects with Name and SKU (Type) properties
+            $Results = $LenovoModelInfo | Select-Object Name, @{N='SKU';E={
+                if ($_.Types -and $_.Types.Type) {
+                    ($_.Types.Type -join ', ')
+                } else {
+                    $null
+                }
+            }} | Sort-Object Name
+            return $Results
         }
         else {
             # Suppress noisy warnings when we're using a wildcard (e.g. "*" to just force-load the cache).
@@ -1707,6 +1714,7 @@ function Find-DellModel {
     .DESCRIPTION
         Downloads the Dell DriverPack catalog if not present and searches for the model.
         Supports partial/wildcard matching (e.g. "Latitude 7" matches "Latitude 7420").
+        Returns objects with Name and SKU (system ID) properties.
     .PARAMETER Model
         The model name to search for (e.g. "Latitude 7420").
     .EXAMPLE
@@ -1812,16 +1820,21 @@ function Find-DellModel {
         }
 
         $modelPattern = if ($Model -match "[\\*\\?]") { $Model } else { "*$Model*" }
-        $Matches = foreach ($pkg in $global:DellModelDrivers) {
+        $Results = foreach ($pkg in $global:DellModelDrivers) {
             foreach ($m in $pkg.SupportedSystems.Brand.Model) {
-                if ($m.name -like $modelPattern) { $m.name }
+                if ($m.name -like $modelPattern) {
+                    [pscustomobject]@{
+                        Name = $m.name
+                        SKU  = $m.systemID
+                    }
+                }
             }
         }
-        $Matches = $Matches | Sort-Object -Unique
+        $Results = $Results | Sort-Object -Property Name -Unique
 
-        if ($Matches -and $Matches.Count -gt 0) {
-            Write-LogEntry -Value "- Found $($Matches.Count) matching model(s)" -Severity 1
-            return $Matches
+        if ($Results -and $Results.Count -gt 0) {
+            Write-LogEntry -Value "- Found $($Results.Count) matching model(s)" -Severity 1
+            return $Results
         }
         else {
             # Suppress noisy warnings when we're using a wildcard (e.g. "*" to just force-load the cache).
@@ -1841,6 +1854,7 @@ function Find-HPModel {
     .DESCRIPTION
         Downloads the HP Client Driver Pack catalog if not present and searches for the model.
         Supports partial/wildcard matching (e.g. "EliteBook 8" matches "EliteBook 840 G7").
+        Returns objects with Name and SKU (system ID) properties.
     .PARAMETER Model
         The model name to search for (e.g. "EliteBook 840 G7").
     .EXAMPLE
@@ -1949,14 +1963,19 @@ function Find-HPModel {
             $global:HPModelXMLLoadTime = $xmlLastWrite
         }
         $modelPattern = if ($Model -match "[\\*\\?]") { $Model } else { "*$Model*" }
-        $Matches = foreach ($pkg in $global:HPModelDrivers) {
-            if ($pkg.ProductNames.ProductName -like $modelPattern) { $pkg.ProductNames.ProductName }
+        $Results = foreach ($pkg in $global:HPModelDrivers) {
+            if ($pkg.SystemName -like $modelPattern) {
+                [pscustomobject]@{
+                    Name = $pkg.SystemName
+                    SKU  = $pkg.SystemId
+                }
+            }
         }
-        $Matches = $Matches | Sort-Object -Unique
+        $Results = $Results | Sort-Object -Property Name -Unique
 
-        if ($Matches -and $Matches.Count -gt 0) {
-            Write-LogEntry -Value "- Found $($Matches.Count) matching model(s)" -Severity 1
-            return $Matches
+        if ($Results -and $Results.Count -gt 0) {
+            Write-LogEntry -Value "- Found $($Results.Count) matching model(s)" -Severity 1
+            return $Results
         }
         else {
             # Suppress noisy warnings when we're using a wildcard (e.g. "*" to just force-load the cache).
@@ -3881,16 +3900,228 @@ function Get-HPDrivers {
     Write-LogEntry -Value "======== Get-HPDrivers Complete ========" -Severity 1
 }
 
+# // =================== CUSTOM DRIVER LOGIC ====================== //
+
+function Get-CustomDrivers {
+    <#
+    .SYNOPSIS
+        Creates a custom driver package in SCCM from a local folder.
+    .DESCRIPTION
+        Interactively prompts for all required details to stage drivers, create an
+        SCCM package, and distribute content to DP Groups. For use with drivers
+        that are not available from Lenovo, Dell, or HP catalogs.
+    .PARAMETER Manufacturer
+        The manufacturer name (e.g. "Microsoft", "VMware").
+    .PARAMETER Model
+        The model or device name (e.g. "Surface Pro 7", "VMware SVGA").
+    .PARAMETER OSName
+        The operating system name (e.g. "Windows 10", "Windows 11").
+    .PARAMETER OSVersion
+        The OS version (e.g. "22H2", "23H2").
+    .PARAMETER Architecture
+        The OS architecture (e.g. "x64", "x86").
+    .PARAMETER SourceFolder
+        The path to the folder containing the driver files.
+    .PARAMETER PackageFormat
+        Package storage format: Raw, Zip, or WIM. Defaults to settings.
+    .PARAMETER SkipDistribution
+        Skip content distribution to DP Groups after package creation.
+    .PARAMETER Force
+        Force re-import even if the same package already exists in SCCM.
+    .EXAMPLE
+        Get-CustomDrivers
+    .EXAMPLE
+        Get-CustomDrivers -SourceFolder "C:\Drivers\SurfacePro7" -Model "Surface Pro 7"
+    #>
+    [CmdletBinding()]
+    param (
+        [string]$Manufacturer,
+        [string]$Model,
+        [string]$OSName,
+        [string]$OSVersion,
+        [string]$Architecture,
+        [string]$SourceFolder,
+        [ValidateSet("Raw", "Zip", "WIM")]
+        [string]$PackageFormat,
+        [switch]$SkipDistribution,
+        [switch]$Force
+    )
+
+    # 1. Validate settings
+    $Settings = Get-DASettings
+    if (-not (Test-DASettings)) {
+        return
+    }
+    $EffectivePackageFormat = if ($PSBoundParameters.ContainsKey('PackageFormat')) { $PackageFormat } else { $Settings.PackageFormat }
+    if (-not $SiteServer) { $SiteServer = $Settings.SiteServer }
+    if (-not $PackagePath) { $PackagePath = $Settings.PackagePath }
+
+    # 2. Connect to ConfigMgr
+    if (-not (Initialize-SCCMConnection)) {
+        Write-LogEntry -Value "[Error] - Failed to connect to ConfigMgr." -Severity 3
+        return
+    }
+
+    Write-LogEntry -Value "======== Starting Get-CustomDrivers ========" -Severity 1
+
+    # 3. Interactive prompts for missing parameters
+    if (-not $Manufacturer) {
+        $Manufacturer = Read-Host "Enter manufacturer name (e.g. Microsoft, VMware)"
+        if (-not $Manufacturer) {
+            Write-LogEntry -Value "[Warning] - No manufacturer provided. Exiting." -Severity 2
+            return
+        }
+    }
+
+    if (-not $Model) {
+        $Model = Read-Host "Enter model name (e.g. Surface Pro 7)"
+        if (-not $Model) {
+            Write-LogEntry -Value "[Warning] - No model provided. Exiting." -Severity 2
+            return
+        }
+    }
+
+    if (-not $OSName) {
+        $OsInput = Read-Host "Enter OS (1=Windows 10, 2=Windows 11)"
+        switch ($OsInput) {
+            "1" { $OSName = "Windows 10" }
+            "2" { $OSName = "Windows 11" }
+            default { $OSName = if ($OsInput -match "11") { "Windows 11" } else { "Windows 10" } }
+        }
+    }
+
+    if (-not $OSVersion) {
+        $OSVersion = Read-Host "Enter OS version (e.g. 22H2, 23H2, or leave blank)"
+        if ([string]::IsNullOrWhiteSpace($OSVersion)) { $OSVersion = "" }
+    }
+
+    if (-not $Architecture) {
+        $ArchInput = Read-Host "Enter architecture (1=x64, 2=x86) [1]"
+        switch ($ArchInput) {
+            "2" { $Architecture = "x86" }
+            default { $Architecture = "x64" }
+        }
+    }
+
+    if (-not $SourceFolder) {
+        $SourceFolder = Read-Host "Enter path to source driver folder"
+        if (-not $SourceFolder -or -not (Test-Path -Path $SourceFolder -PathType Container)) {
+            Write-LogEntry -Value "[Error] - Source folder '$SourceFolder' not found." -Severity 3
+            return
+        }
+    }
+
+    Write-LogEntry -Value "- Manufacturer: $Manufacturer" -Severity 1
+    Write-LogEntry -Value "- Model: $Model" -Severity 1
+    Write-LogEntry -Value "- OS: $OSName $OSVersion | Arch: $Architecture" -Severity 1
+    Write-LogEntry -Value "- Source: $SourceFolder" -Severity 1
+    Write-LogEntry -Value "- Format: $EffectivePackageFormat" -Severity 1
+
+    # 4. Build folder structure
+    $FolderOs = ($OSName -replace 'Windows\s+', 'Windows')
+    $FolderOs = ($FolderOs -replace '\s+', '')
+    $FolderModel = ($Model -replace '[<>:"/\\|?*]', '').Trim()
+    if ($OSVersion) {
+        $FolderName = "$FolderOs-$OSVersion-$Architecture"
+    }
+    else {
+        $FolderName = "$FolderOs-$Architecture"
+    }
+
+    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath $Manufacturer) $FolderModel) $FolderName
+
+    # 5. Build SCCM package name
+    $OSDisplay = ($OSName -replace "Windows(\d+)", "Windows $1").Trim()
+    if ($OSVersion) {
+        $CMPackageName = "Drivers - $Manufacturer $Model - $OSDisplay $OSVersion $Architecture"
+    }
+    else {
+        $CMPackageName = "Drivers - $Manufacturer $Model - $OSDisplay $Architecture"
+    }
+
+    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
+
+    # 6. Check for existing package
+    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
+    $ExistingPackage = $ExistingPackages | Select-Object -First 1
+
+    if ($ExistingPackage) {
+        if ($Force) {
+            Write-LogEntry -Value "- Package already exists. Force specified; removing existing package $($ExistingPackage.PackageID) and source files." -Severity 1
+            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
+            try {
+                if (Test-Path -Path $FinalPackageDest) {
+                    $Stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+                    $BackupPath = "${FinalPackageDest}_backup_$Stamp"
+                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
+                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
+                }
+            }
+            catch {
+                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
+            }
+        }
+        else {
+            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
+            Write-LogEntry -Value "======== Get-CustomDrivers Complete (Already Present) ========" -Severity 1
+            return
+        }
+    }
+
+    # 7. Stage driver files to final UNC package source
+    if (New-DriverPackage -Make "Custom" -DriverExtractDest $SourceFolder -Architecture $Architecture -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
+        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
+    }
+    else {
+        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
+        return
+    }
+
+    # 8. Create SCCM Package
+    $MifVersion = "$OSDisplay $Architecture"
+    $NewPackage = New-CMPackage -SiteServer $SiteServer `
+        -Name $CMPackageName `
+        -PkgSourcePath $FinalPackageDest `
+        -Manufacturer $Manufacturer `
+        -Version "1.0" `
+        -MifName $Model `
+        -MifVersion $MifVersion `
+        -EnableBinaryDeltaReplication $Settings.EnableBinaryDeltaReplication
+
+    if (-not $NewPackage -or -not $NewPackage.PackageID) {
+        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
+        return
+    }
+    $PackageID = $NewPackage.PackageID
+    Write-LogEntry -Value "- SCCM package created: $PackageID" -Severity 1
+
+    # Place package into "Driver Packages\<Manufacturer>" console folder
+    $ConsoleFolder = "Driver Packages\\$Manufacturer"
+    $FolderNodeId = Ensure-CMFolderPath -Path $ConsoleFolder -ObjectType 2
+    if ($FolderNodeId) {
+        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
+            Write-LogEntry -Value "- Package $PackageID placed in console folder: $ConsoleFolder" -Severity 1
+        }
+    }
+
+    # 9. Distribute content to DP Groups
+    if (-not $SkipDistribution) {
+        if ($Settings.DistributionPointGroups -and $Settings.DistributionPointGroups.Count -gt 0) {
+            Invoke-ContentDistribution -SiteServer $SiteServer `
+                -PackageID $PackageID `
+                -DistributionPointGroupNames $Settings.DistributionPointGroups
+        }
+    }
+
+    Write-LogEntry -Value "======== Get-CustomDrivers Complete ========" -Severity 1
+}
 
 # Export functions - only user-facing commands
 Export-ModuleMember -Function @(
-    # Logging
-    'Write-LogEntry',
     # Settings
     'Get-DASettings',
     'Set-DASettings',
     # OEM / Lenovo Driver Automation
-    'Get-OEMLinks',
     'Find-LenovoModel',
     'Get-LenovoDrivers',
     # OEM / Dell Driver Automation
@@ -3898,5 +4129,7 @@ Export-ModuleMember -Function @(
     'Get-DellDrivers',
     # OEM / HP Driver Automation
     'Find-HPModel',
-    'Get-HPDrivers'
+    'Get-HPDrivers',
+    # Custom Driver Automation
+    'Get-CustomDrivers'
 )

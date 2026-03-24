@@ -2,11 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.5.4 - 2026-03-24
+- Added `Get-CustomDrivers` for creating custom (non-OEM) driver packages in SCCM.
+- Fixed `Get-CustomDrivers` to place SCCM package in a manufacturer-specific console folder (e.g. `Driver Packages\Microsoft`).
+- Removed `Get-OEMLinks` and `Write-LogEntry` from module exports - both are internal and not intended for direct use.
+
 ## 1.5.3 - 2026-03-24
 - Removed Architecture setting from configuration - no longer needed with current module workflow.
 - Module will auto-create DASettings.json on first run if it does not exist.
 - Added `Test-DASettings` helper to validate all settings - checks that no settings are blank/empty.
 - Updated `Get-LenovoDrivers`, `Get-DellDrivers`, and `Get-HPDrivers` to validate settings before running.
+- `Find-LenovoModel` now returns objects with Name and SKU (machine type) properties.
+- `Find-DellModel` now returns objects with Name and SKU (system ID) properties.
+- `Find-HPModel` now returns objects with Name and SKU (system ID) properties.
+- Fixed `Find-HPModel` to use `SystemName` instead of missing `ProductNames.ProductName` property.
 
 ## 1.5.2 - 2026-03-20
 - New Internal Helpers: Added Filter-DriverPackResults, Merge-DriverPackDuplicates, and Select-DriverPack to standardize filtering and interactive selection.
