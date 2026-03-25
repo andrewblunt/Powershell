@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "1.6.0"
+$ScriptRelease = "2.0.0"
 $ScriptBuildDate = "2026-03-24"
 
 # Hash Tables
@@ -4494,6 +4494,154 @@ function Get-CustomDrivers {
     Write-LogEntry -Value "======== Get-CustomDrivers Complete ========" -Severity 1
 }
 
+# // =================== INTERACTIVE CLI ====================== //
+
+function Start-DriverAutomationCLI {
+    <#
+    .SYNOPSIS
+        Launches an interactive command-line interface for the Driver Automation Tool.
+    .DESCRIPTION
+        Provides a menu-driven interface for discovering models, downloading drivers,
+        and managing settings across all supported OEMs (Lenovo, Dell, HP, Microsoft).
+    .EXAMPLE
+        Start-DriverAutomationCLI
+    #>
+    [CmdletBinding()]
+    param ()
+
+    $OEMMenu = @(
+        @{ Key = "1"; Label = "Lenovo";   FindCmd = "Find-LenovoModel";   GetCmd = "Get-LenovoDrivers"   },
+        @{ Key = "2"; Label = "Dell";     FindCmd = "Find-DellModel";     GetCmd = "Get-DellDrivers"     },
+        @{ Key = "3"; Label = "HP";       FindCmd = "Find-HPModel";       GetCmd = "Get-HPDrivers"       },
+        @{ Key = "4"; Label = "Microsoft"; FindCmd = "Find-MicrosoftModel"; GetCmd = "Get-MicrosoftDrivers" },
+        @{ Key = "5"; Label = "Custom";   FindCmd = $null;                GetCmd = "Get-CustomDrivers"   }
+    )
+
+    function Show-OEMMenu {
+        param([string]$Action, [string]$Filter)
+        Write-Host ""
+        Write-Host "  Select OEM for ${Action}:" -ForegroundColor Cyan
+        $filteredOEMs = if ($Filter -eq "FindModel") { $OEMMenu | Where-Object { $_.FindCmd } } else { $OEMMenu }
+        foreach ($oem in $filteredOEMs) {
+            Write-Host "    [$($oem.Key)] $($oem.Label)"
+        }
+        Write-Host "    [B] Back"
+        $input = Read-Host "  Selection"
+        return $input
+    }
+
+    function Show-SubMenu {
+        param([string]$Title, [string[]]$Items)
+        Write-Host ""
+        Write-Host "  $Title" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            Write-Host "    [$($i + 1)] $($Items[$i])"
+        }
+        Write-Host "    [B] Back"
+        $input = Read-Host "  Selection"
+        return $input
+    }
+
+    while ($true) {
+        Clear-Host
+        Write-Host ""
+        Write-Host "  ==============================================" -ForegroundColor DarkCyan
+        Write-Host "   Driver Automation Tool $ScriptRelease" -ForegroundColor White
+        Write-Host "  ==============================================" -ForegroundColor DarkCyan
+        Write-Host ""
+        Write-Host "    [1] Model Lookup"
+        Write-Host "    [2] Download Drivers"
+        Write-Host "    [3] Create Custom Driver Package"
+        Write-Host "    [4] Settings"
+        Write-Host "    [Q] Quit"
+        Write-Host ""
+        Write-Host "  ==============================================" -ForegroundColor DarkCyan
+
+        $mainChoice = Read-Host "  Selection"
+
+        switch ($mainChoice.ToUpper()) {
+            "1" {
+                $oemChoice = Show-OEMMenu -Action "Model Lookup" -Filter "FindModel"
+                if ($oemChoice -match '^\d+$' -and [int]$oemChoice -ge 1 -and [int]$oemChoice -le 5) {
+                    $selectedOEM = $OEMMenu[[int]$oemChoice - 1]
+                    if ($selectedOEM.FindCmd) {
+                        $searchModel = Read-Host "  Enter model search term"
+                        if ($searchModel) {
+                            Write-Host ""
+                            $results = & $selectedOEM.FindCmd -Model $searchModel
+                            if ($results) {
+                                $results | Format-Table -AutoSize
+                            }
+                            else {
+                                Write-Host "  No models found matching '$searchModel'." -ForegroundColor Yellow
+                            }
+                        }
+                        else {
+                            Write-Host "  No search term provided." -ForegroundColor Yellow
+                        }
+                    }
+                    else {
+                        Write-Host "  Find Model not available for $($selectedOEM.Label)." -ForegroundColor Yellow
+                    }
+                }
+                Read-Host "  Press Enter to continue"
+            }
+            "2" {
+                $oemChoice = Show-OEMMenu -Action "Download Drivers"
+                if ($oemChoice -match '^\d+$' -and [int]$oemChoice -ge 1 -and [int]$oemChoice -le 5) {
+                    $selectedOEM = $OEMMenu[[int]$oemChoice - 1]
+                    Write-Host ""
+                    Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
+                    Write-Host ""
+                    & $selectedOEM.GetCmd
+                }
+                Read-Host "  Press Enter to continue"
+            }
+            "3" {
+                Write-Host ""
+                Write-Host "  Starting custom driver package creation..." -ForegroundColor Green
+                Write-Host ""
+                Get-CustomDrivers
+                Read-Host "  Press Enter to continue"
+            }
+            "4" {
+                $settingsChoice = Show-SubMenu -Title "Settings" -Items @("View Settings", "Configure Settings")
+                if ($settingsChoice -eq "1") {
+                    Write-Host ""
+                    $settings = Get-DASettings
+                    if ($settings) {
+                        $settings | Format-List
+                    }
+                    Write-Host "  [1] Modify Settings" -ForegroundColor Cyan
+                    Write-Host "  [B] Back to menu"
+                    $afterView = Read-Host "  Selection"
+                    if ($afterView -eq "1") {
+                        Write-Host ""
+                        Write-Host "  Launching interactive settings configuration..." -ForegroundColor Green
+                        Write-Host ""
+                        Set-DASettings
+                    }
+                }
+                elseif ($settingsChoice -eq "2") {
+                    Write-Host ""
+                    Write-Host "  Launching interactive settings configuration..." -ForegroundColor Green
+                    Write-Host ""
+                    Set-DASettings
+                }
+            }
+            "Q" {
+                Write-Host ""
+                Write-Host "  Goodbye." -ForegroundColor DarkCyan
+                return
+            }
+            default {
+                Write-Host "  Invalid selection." -ForegroundColor Red
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+}
+
 # Export functions - only user-facing commands
 Export-ModuleMember -Function @(
     # Settings
@@ -4512,5 +4660,7 @@ Export-ModuleMember -Function @(
     'Find-MicrosoftModel',
     'Get-MicrosoftDrivers',
     # Custom Driver Automation
-    'Get-CustomDrivers'
+    'Get-CustomDrivers',
+    # Interactive CLI
+    'Start-DriverAutomationCLI'
 )
