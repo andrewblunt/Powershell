@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "1.5.4"
+$ScriptRelease = "1.6.0"
 $ScriptBuildDate = "2026-03-24"
 
 # Hash Tables
@@ -120,15 +120,13 @@ function Get-DASettings {
                 # Leave as-is if normalization fails
             }
         }
-        $global:DownloadPath = $ResolvedDownloadPath
-        if ($global:DownloadPath) {
-            $global:TempDirectory = $global:DownloadPath
+        if ($ResolvedDownloadPath) {
+            $global:TempDirectory = $ResolvedDownloadPath
             if (-not (Test-Path $global:TempDirectory)) {
                 New-Item -Path $global:TempDirectory -ItemType Directory -Force | Out-Null
             }
         }
 
-        $global:PackageFormat = $Settings.PackageFormat
         $global:CleanupDownloadPath = $Settings.CleanupDownloadPath
         $global:DPGroups = $Settings.DistributionPointGroups
 
@@ -569,6 +567,16 @@ $global:HPModelXML = $null
 $global:HPModelDrivers = $null
 $global:HPSoftPaqList = $null
 $global:SCCMNamespace = $null
+
+# Microsoft Variables
+$MicrosoftJSONSource = ($global:OEMLinks.OEM.Manufacturer | Where-Object {
+        $_.Name -match "Microsoft"
+    }).Link | Where-Object {
+    $_.Type -eq "JSONSource"
+} | Select-Object -ExpandProperty URL
+
+$global:MicrosoftJSONFile = if ($MicrosoftJSONSource) { "build-driverpack.json" } else { "" }
+$global:MicrosoftModelDrivers = $null
 
 # // =================== CONFIGMGR LOGIC ====================== //
 
@@ -2298,6 +2306,21 @@ function Invoke-ContentExtraction {
             Write-LogEntry -Value "[Error] - Extraction failed with exit code $($Process.ExitCode)" -Severity 3
             return $false
         }
+        elseif ($Make -eq "Microsoft" -or $SourceFile -match "\\.msi$") {
+            # Microsoft Surface drivers use MSI packages - extract using msiexec /a (administrative install)
+            $SilentSwitches = "/a `"$SourceFile`" /qn TARGETDIR=`"$DestinationFolder`""
+            Write-LogEntry -Value "- Using Microsoft MSI extraction: msiexec $SilentSwitches" -Severity 1
+
+            $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $SilentSwitches -PassThru -Wait -NoNewWindow
+            if ($Process.ExitCode -eq 0) {
+                Write-LogEntry -Value "- MSI extraction completed successfully" -Severity 1
+                return $true
+            }
+            else {
+                Write-LogEntry -Value "[Error] - MSI extraction failed with exit code $($Process.ExitCode)" -Severity 3
+                return $false
+            }
+        }
         # Add other manufacturer logic here when needed
     }
     catch {
@@ -2713,7 +2736,7 @@ function Get-LenovoDrivers {
             } | Select-Object -First 1
 
             if ($MatchedSccm) {
-                $SelectedPackOsName = Convert-LenovoOs -OsCode $MatchedSccm.os
+                $SelectedPackOsName = Convert-OSName -OSName $MatchedSccm.os
                 $SelectedPackArch = Get-LenovoArchFromUrl -Url $MatchedSccm.'#text' -FallbackArch $Architecture
                 $SelectedPackDate = Get-LenovoDateCompact -DateValue $MatchedSccm.date
                 $OSName = $SelectedPackOsName
@@ -2801,7 +2824,7 @@ function Get-LenovoDrivers {
 
     # 11. Create SCCM Package via CIM/DCOM
     $MifVersion = "$OSDisplay $Architecture"
-    $SkuValue = if ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } elseif ($SKU -is [array]) { ($SKU | Select-Object -First 1) } else { $SKU }
+    $SkuValue = if ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } elseif ($SKU -is [array]) { ($SKU | Select-Object -First 1).SKU } else { $SKU.SKU }
     $PackageDescription = "(Models included:$SkuValue)"
 
     # Create a new SCCM package (do not update existing packages)
@@ -2987,13 +3010,12 @@ function Get-DellDrivers {
         return
     }
 
-    # 4. If no model is provided, prompt and search the catalog, then let the user pick a pack
+    # 4. If we don't have enough info to automate, prompt or search/select
     $SelectedPack = $null
     $SelectedPackOsName = $null
     $SelectedPackArch = $null
     $ModelTypes = @()
 
-    # 4. If we don't have enough info to automate, prompt or search/select
     $Automated = ($Model -and $OSName -and $OSVersion)
     if (-not $Automated) {
         if (-not $global:DellModelDrivers) {
@@ -3518,7 +3540,7 @@ function Get-HPDrivers {
     }
 
     # -------------------------------------------------------------------------
-    # 3. Ensure the HP catalog is loaded
+    # 4. Ensure the HP catalog is loaded
     # -------------------------------------------------------------------------
     if (-not $global:HPModelDrivers) {
         Find-HPModel -Model "*" | Out-Null
@@ -3900,6 +3922,362 @@ function Get-HPDrivers {
     Write-LogEntry -Value "======== Get-HPDrivers Complete ========" -Severity 1
 }
 
+# // =================== MICROSOFT DRIVER LOGIC ====================== //
+
+function Find-MicrosoftModel {
+    <#
+    .SYNOPSIS
+        Looks up a Microsoft Surface model in the JSON catalog.
+    .DESCRIPTION
+        Downloads the Microsoft Surface driver catalog if not present and searches for the model.
+        Supports partial/wildcard matching (e.g. "Surface Pro" matches "Surface Pro 7").
+        Returns objects with Name and SKU (Product ID) properties.
+    .PARAMETER Model
+        The model name to search for (e.g. "Surface Pro 7").
+    .EXAMPLE
+        Find-MicrosoftModel -Model "Surface Pro 7"
+    .EXAMPLE
+        Find-MicrosoftModel -Model "Surface Pro"  # Returns all Surface Pro variants
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false, HelpMessage = "Specify the Microsoft model name.")]
+        [string]$Model
+    )
+
+    Get-DASettings | Out-Null
+
+    if ([string]::IsNullOrWhiteSpace($Model)) {
+        $Model = Read-Host "Enter Microsoft model search (e.g. Surface Pro 7)"
+        if (-not $Model) {
+            Write-LogEntry -Value "[Warning] - No model search provided. Exiting." -Severity 2
+            return $null
+        }
+    }
+
+    if (-not $MicrosoftJSONSource) {
+        Write-LogEntry -Value "[Error] - Microsoft JSON source not found in OEMLinks.xml." -Severity 3
+        return $null
+    }
+
+    $microsoftJsonPath = Join-Path $global:TempDirectory -ChildPath $global:MicrosoftJSONFile
+
+    $refreshNeeded = $false
+    if (Test-Path -Path $microsoftJsonPath) {
+        try {
+            $AgeDays = (New-TimeSpan -Start (Get-Item $microsoftJsonPath).LastWriteTime -End (Get-Date)).TotalDays
+            if ($AgeDays -ge 1) { $refreshNeeded = $true }
+        }
+        catch {
+            $refreshNeeded = $true
+        }
+    }
+
+    if (-not (Test-Path -Path $microsoftJsonPath) -or $refreshNeeded) {
+        if ($refreshNeeded) {
+            $global:MicrosoftModelDrivers = $null
+        }
+        Write-LogEntry -Value "======== Downloading Microsoft Surface Driver Catalog ========" -Severity 1
+        try {
+            # GitHub raw URLs need to use raw.githubusercontent.com
+            $downloadUrl = $MicrosoftJSONSource -replace "github.com/([^/]+)/([^/]+)/blob/", "raw.githubusercontent.com/`$1/`$2/"
+            if ($global:ProxySettingsSet) {
+                Start-BitsTransfer -Source $downloadUrl -Destination $microsoftJsonPath @global:BitsProxyOptions
+            }
+            else {
+                Start-BitsTransfer -Source $downloadUrl -Destination $microsoftJsonPath @global:BitsOptions
+            }
+            if (Test-Path -Path $microsoftJsonPath) {
+                try { (Get-Item -Path $microsoftJsonPath).LastWriteTime = Get-Date } catch { }
+            }
+        }
+        catch {
+            Write-LogEntry -Value "[Error] - Failed to download Microsoft JSON: $($_.Exception.Message)" -Severity 3
+            return $null
+        }
+    }
+
+    if (Test-Path -Path $microsoftJsonPath) {
+        if ($null -eq $global:MicrosoftModelDrivers) {
+            Write-LogEntry -Value "- Reading Microsoft driver pack JSON file" -Severity 1
+            $global:MicrosoftModelDrivers = Get-Content -Path $microsoftJsonPath -Raw | ConvertFrom-Json
+        }
+
+        $modelPattern = if ($Model -match "[\\*\\?]") { $Model } else { "*$Model*" }
+        $Results = foreach ($pack in $global:MicrosoftModelDrivers) {
+            if ($pack.Model -like $modelPattern) {
+                [pscustomobject]@{
+                    Name = $pack.Model
+                    SKU  = $pack.Product
+                }
+            }
+        }
+        $Results = $Results | Sort-Object -Property Name -Unique
+
+        if ($Results -and $Results.Count -gt 0) {
+            Write-LogEntry -Value "- Found $($Results.Count) matching model(s)" -Severity 1
+            return $Results
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($Model) -and ($Model -notmatch '^[\\*\\?]+$')) {
+                Write-LogEntry -Value "[Warning] - No models found matching '$Model'" -Severity 2
+            }
+            return $null
+        }
+    }
+}
+
+function Get-MicrosoftDrivers {
+    <#
+    .SYNOPSIS
+        Orchestrates the download, packaging, and SCCM registration of Microsoft Surface drivers.
+    .DESCRIPTION
+        This is the main cmdlet for Microsoft Surface driver management. It connects to ConfigMgr
+        via CIM/DCOM (no WinRM required), finds the model information,
+        downloads the driver pack, extracts it, creates a ConfigMgr package, and
+        optionally distributes content to DP Groups.
+    .PARAMETER Model
+        The Microsoft model name (e.g., "Surface Pro 7"). If omitted, you will be prompted to search and select a pack.
+    .PARAMETER OSName
+        The operating system name (e.g. "Windows 10", "Windows 11").
+    .PARAMETER OSVersion
+        The OS version/build (e.g., "21H2", "23H2"). If omitted when Model is specified, you will be prompted.
+    .PARAMETER PackageFormat
+        Package storage format (Raw, Zip, WIM). Defaults to settings.
+    .PARAMETER SkipDistribution
+        Skip content distribution to DP Groups after package creation.
+    .PARAMETER Force
+        Force re-import even if the same package already exists in SCCM.
+    .EXAMPLE
+        Get-MicrosoftDrivers -Model "Surface Pro 7" -OSName "Windows 10" -OSVersion "22H2"
+    .EXAMPLE
+        Get-MicrosoftDrivers -Model "Surface Laptop 5" -OSName "Windows 11" -OSVersion "23H2"
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false, HelpMessage = "Specify the Microsoft model name.")]
+        [string]$Model,
+        [Parameter(Mandatory = $false, HelpMessage = "Specify the OS name (Windows 10 or Windows 11).")]
+        [string]$OSName,
+        [Parameter(Mandatory = $false, HelpMessage = "Specify the OS version (e.g. 22H2, 23H2).")]
+        [string]$OSVersion,
+        [ValidateSet("Raw", "Zip", "WIM")]
+        [string]$PackageFormat,
+        [switch]$SkipDistribution,
+        [switch]$Force
+    )
+
+    # 1. Load Defaults
+    $Settings = Get-DASettings
+    if (-not (Test-DASettings)) {
+        return
+    }
+    $EffectivePackageFormat = if ($PSBoundParameters.ContainsKey('PackageFormat')) { $PackageFormat } else { $Settings.PackageFormat }
+    $SiteServer = $Settings.SiteServer
+    $PackagePath = $Settings.PackagePath
+    $Architecture = "x64"
+
+    # 2. Connect to ConfigMgr
+    if (-not (Initialize-SCCMConnection)) {
+        Write-LogEntry -Value "[Error] - Failed to connect to ConfigMgr." -Severity 3
+        return
+    }
+
+    Write-LogEntry -Value "======== Starting Get-MicrosoftDrivers ========" -Severity 1
+
+    # 3. Force load catalog if needed
+    if (-not $global:MicrosoftModelDrivers) {
+        Find-MicrosoftModel -Model "*" | Out-Null
+    }
+
+    # 4. Get model selection
+    if (-not $Model) {
+        $Model = Read-Host "Enter Microsoft model search (e.g. Surface Pro 7)"
+        if (-not $Model) {
+            Write-LogEntry -Value "[Warning] - No model search provided. Exiting." -Severity 2
+            return
+        }
+    }
+
+    # 5. Find matching driver packs
+    $modelPattern = if ($Model -match "[\\*\\?]") { $Model } else { "*$Model*" }
+    $MatchingPacks = $global:MicrosoftModelDrivers | Where-Object { $_.Model -like $modelPattern }
+
+    if (-not $MatchingPacks) {
+        Write-LogEntry -Value "[Warning] - No driver packs found for model matching '$Model'" -Severity 2
+        return
+    }
+
+    # 6. Filter by OS if provided
+    if ($OSName) {
+        $osToken = if ($OSName -match "11") { "11" } else { "10" }
+        $MatchingPacks = $MatchingPacks | Where-Object { $_.OSVersion -match $osToken }
+    }
+
+    if ($OSVersion) {
+        $MatchingPacks = $MatchingPacks | Where-Object { $_.OSReleaseId -match $OSVersion }
+    }
+
+    if (-not $MatchingPacks -or $MatchingPacks.Count -eq 0) {
+        Write-LogEntry -Value "[Warning] - No driver packs found for $Model with specified OS criteria." -Severity 2
+        return
+    }
+
+    # 7. Let user select pack if multiple options
+    if ($MatchingPacks.Count -gt 1 -and -not $OSName -and -not $OSVersion) {
+        $SelectedPack = Select-DriverPack -PackResults $MatchingPacks -LineFormatter {
+            param($p, $i)
+            $osShort = if ($p.OSVersion -match "11") { "win11" } else { "win10" }
+            "{0}. {1} | {2} | {3} {4} | {5}" -f ($i + 1), $p.Model, $p.Product, $osShort, $p.OSReleaseId, $p.FileName
+        }
+        if (-not $SelectedPack) { return }
+    }
+    else {
+        # Pick latest by CatalogVersion
+        $SelectedPack = $MatchingPacks | Sort-Object -Property CatalogVersion -Descending | Select-Object -First 1
+    }
+
+    $SelectedModel = $SelectedPack.Model
+    $SelectedOSName = if ($SelectedPack.OSVersion -match "11") { "Windows 11" } else { "Windows 10" }
+    $SelectedOSVersion = $SelectedPack.OSReleaseId
+    $SelectedArchitecture = if ($SelectedPack.OSArchitecture -match "arm") { "arm64" } else { "x64" }
+    $SelectedRevision = ($SelectedPack.FileName -replace '\.[^.]+$', '').Split('_')[-1]
+    if (-not $SelectedRevision) { $SelectedRevision = "1.0" }
+
+    Write-LogEntry -Value "- Selected: $SelectedModel - $SelectedOSName $SelectedOSVersion ($SelectedArchitecture)" -Severity 1
+    Write-LogEntry -Value "- OS: $SelectedOSName $SelectedOSVersion | Arch: $SelectedArchitecture" -Severity 1
+
+    # 8. Build folder structure - use Product (SKU) for unique folder naming per Microsoft convention
+    $FolderOs = ($SelectedOSName -replace 'Windows\s+', 'Windows')
+    $FolderOs = ($FolderOs -replace '\s+', '')
+    $FolderModel = $SelectedPack.Product
+    if ($SelectedOSVersion) {
+        $FolderName = "$FolderOs-$SelectedOSVersion-$SelectedArchitecture-$SelectedRevision"
+    }
+    else {
+        $FolderName = "$FolderOs-$SelectedArchitecture-$SelectedRevision"
+    }
+
+    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Microsoft") $FolderModel) $FolderName
+
+    # 9. Build SCCM package name
+    $OSDisplay = $SelectedOSName
+    if ($SelectedOSVersion) {
+        $CMPackageName = "Drivers - Microsoft $($SelectedPack.Product) - $OSDisplay $SelectedOSVersion $SelectedArchitecture"
+    }
+    else {
+        $CMPackageName = "Drivers - Microsoft $($SelectedPack.Product) - $OSDisplay $SelectedArchitecture"
+    }
+
+    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
+
+    # 10. Check for existing package
+    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
+    $ExistingPackage = $ExistingPackages | Where-Object { $_.Version -eq $SelectedRevision } | Select-Object -First 1
+
+    if ($ExistingPackage) {
+        if ($Force) {
+            Write-LogEntry -Value "- Package already exists. Force specified; removing existing package $($ExistingPackage.PackageID) and source files." -Severity 1
+            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
+            try {
+                if (Test-Path -Path $FinalPackageDest) {
+                    $Stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+                    $BackupPath = "${FinalPackageDest}_backup_$Stamp"
+                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
+                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
+                }
+            }
+            catch {
+                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
+            }
+        }
+        else {
+            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
+            Write-LogEntry -Value "======== Get-MicrosoftDrivers Complete (Already Present) ========" -Severity 1
+            return
+        }
+    }
+
+    # 11. Download
+    $TempDest = Join-Path $global:TempDirectory -ChildPath $SelectedPack.FileName
+    if (-not (Invoke-ContentDownload -DownloadURL $SelectedPack.Url -DestinationPath $TempDest -ModelName $SelectedModel)) {
+        return
+    }
+
+    # 12. Extract
+    $ExtractSubDir = "$($SelectedModel.Replace(' ', ''))_Drivers_$SelectedRevision"
+    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
+    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make "Microsoft")) {
+        return
+    }
+
+    # 13. Stage driver files
+    if (New-DriverPackage -Make "Microsoft" -DriverExtractDest $ExtractDest -Architecture $SelectedArchitecture -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
+        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
+    }
+    else {
+        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
+        return
+    }
+
+    # 14. Create SCCM Package
+    $MifVersion = "$OSDisplay $SelectedArchitecture"
+    $SkuValue = $SelectedPack.Product
+    $PackageDescription = "(Models included:$SkuValue)"
+
+    $NewPackage = New-CMPackage -SiteServer $SiteServer `
+        -Name $CMPackageName `
+        -PkgSourcePath $FinalPackageDest `
+        -Manufacturer "Microsoft" `
+        -Version $SelectedRevision `
+        -Description $PackageDescription `
+        -MifName $SelectedModel `
+        -MifVersion $MifVersion `
+        -EnableBinaryDeltaReplication $Settings.EnableBinaryDeltaReplication
+
+    if (-not $NewPackage -or -not $NewPackage.PackageID) {
+        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
+        return
+    }
+    $PackageID = $NewPackage.PackageID
+    Write-LogEntry -Value "- SCCM package created: $PackageID" -Severity 1
+
+    # 15. Place package into "Driver Packages\Microsoft" console folder
+    $ConsoleFolder = "Driver Packages\\Microsoft"
+    $FolderNodeId = Ensure-CMFolderPath -Path $ConsoleFolder -ObjectType 2
+    if ($FolderNodeId) {
+        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
+            Write-LogEntry -Value "- Package $PackageID placed in console folder: $ConsoleFolder" -Severity 1
+        }
+    }
+
+    # 16. Distribute content to DP Groups
+    if (-not $SkipDistribution) {
+        if ($Settings.DistributionPointGroups -and $Settings.DistributionPointGroups.Count -gt 0) {
+            Invoke-ContentDistribution -SiteServer $SiteServer `
+                -PackageID $PackageID `
+                -DistributionPointGroupNames $Settings.DistributionPointGroups
+        }
+    }
+
+    # 17. Cleanup
+    if ($Settings.CleanupDownloadPath) {
+        try {
+            foreach ($p in @($TempDest, $ExtractDest)) {
+                if ($p -and (Test-Path -Path $p)) {
+                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+                    Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
+                }
+            }
+        }
+        catch {
+            Write-LogEntry -Value "[Warning] - Cleanup failed for ${TempDest} or ${ExtractDest}: $($_.Exception.Message)" -Severity 2
+        }
+    }
+
+    Write-LogEntry -Value "======== Get-MicrosoftDrivers Complete ========" -Severity 1
+}
+
 # // =================== CUSTOM DRIVER LOGIC ====================== //
 
 function Get-CustomDrivers {
@@ -4130,6 +4508,9 @@ Export-ModuleMember -Function @(
     # OEM / HP Driver Automation
     'Find-HPModel',
     'Get-HPDrivers',
+    # OEM / Microsoft Driver Automation
+    'Find-MicrosoftModel',
+    'Get-MicrosoftDrivers',
     # Custom Driver Automation
     'Get-CustomDrivers'
 )

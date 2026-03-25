@@ -2,10 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.6.0 - 2026-03-24
+- Added `Find-MicrosoftModel` for searching Microsoft Surface device catalog (JSON-based).
+- Added `Get-MicrosoftDrivers` for downloading and packaging Microsoft Surface driver packs.
+- Microsoft catalog uses JSONSource from OEMLinks.xml for model/driver data.
+- Surface packages are organized under `Driver Packages\Microsoft` in the SCCM console.
+- Added MSI extraction support in `Invoke-ContentExtraction` using `msiexec /a` for Surface driver packs.
+- Microsoft package folders use Product (SKU) naming to avoid collisions between variants (e.g. Commercial vs Consumer).
+- Microsoft pack selection uses consistent formatting with Lenovo/Dell/HP output.
+
 ## 1.5.4 - 2026-03-24
 - Added `Get-CustomDrivers` for creating custom (non-OEM) driver packages in SCCM.
 - Fixed `Get-CustomDrivers` to place SCCM package in a manufacturer-specific console folder (e.g. `Driver Packages\Microsoft`).
 - Removed `Get-OEMLinks` and `Write-LogEntry` from module exports - both are internal and not intended for direct use.
+- Fixed `Convert-LenovoOs` call to `Convert-OSName` in `Get-LenovoDrivers`.
+- Fixed `$SKU` object handling after `Find-LenovoModel` now returns objects.
+- Removed redundant global variables `$global:DownloadPath` and `$global:PackageFormat`.
+- Fixed duplicate section numbering in `Get-DellDrivers` and `Get-HPDrivers`.
 
 ## 1.5.3 - 2026-03-24
 - Removed Architecture setting from configuration - no longer needed with current module workflow.
