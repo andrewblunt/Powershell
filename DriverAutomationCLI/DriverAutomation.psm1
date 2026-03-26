@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "2.1.1"
+$ScriptRelease = "2.2.0"
 $ScriptBuildDate = "2026-03-26"
 
 # Hash Tables
@@ -385,7 +385,7 @@ function Write-LogEntry {
 
 # // =================== SHARED PACK HELPERS ====================== //
 
-function Filter-DriverPackResults {
+function Select-DriverPackResults {
     <#
     Filters a candidate driver pack list by requested OS family and OS version.
     Expected common properties:
@@ -703,11 +703,13 @@ function Test-DriverPackageExists {
     # accidental downgrades when the selected pack is older than what's already in SCCM.
     if ($checkInput.OSName -and $checkInput.Architecture) {
         $basePrefix = Build-DriverPackageName -OEM $OEM -Model $checkInput.ModelForCheck -OSName $checkInput.OSName
-        $escapedPrefix = Escape-WqlString "$basePrefix "
+        $escapedPrefix = ConvertTo-WqlEscapedString "$basePrefix "
         $relatedPackages = @(Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$escapedPrefix')" -TimeoutSec $TimeoutSec)
+        $selectedKey = Get-OSVersionSortKey -OSVersion $checkInput.OSVersion
 
-        if ($relatedPackages.Count -gt 0) {
-            $selectedKey = Get-OSVersionSortKey -OSVersion $checkInput.OSVersion
+        # Only do "newer package exists" checks when the selected pack has a
+        # parseable OS version token. Otherwise rely on exact-name existence.
+        if ($selectedKey -gt 0 -and $relatedPackages.Count -gt 0) {
             $candidates = foreach ($pkg in $relatedPackages) {
                 if (-not $pkg.Name) { continue }
                 if ($pkg.Name -notmatch " - $([regex]::Escape($checkInput.OSName))\s+([0-9]{2}H[12]|[0-9]{4})\s+([A-Za-z0-9]+)$") { continue }
@@ -1113,7 +1115,7 @@ function Get-SCCMNamespace {
     return "root\\SMS"
 }
 
-function Escape-WqlString {
+function ConvertTo-WqlEscapedString {
     param([string]$Value)
     if ($null -eq $Value) { return $null }
     return ($Value -replace "'", "''")
@@ -1269,20 +1271,20 @@ function Get-CMPackageCim {
     $Where = $null
 
     if ($PackageID) {
-        $Where = "PackageID = '$(Escape-WqlString $PackageID)'"
+        $Where = "PackageID = '$(ConvertTo-WqlEscapedString $PackageID)'"
     }
     elseif ($Name) {
-        $Where = "Name = '$(Escape-WqlString $Name)'"
+        $Where = "Name = '$(ConvertTo-WqlEscapedString $Name)'"
     }
     elseif ($NameFilter) {
         # Flexible regex for startswith(Name, 'prefix')
         if ($NameFilter -match "(?i)startswith\s*\(\s*Name\s*,\s*['""]([^'""\)]*)['""]\s*\)") {
-            $prefix = Escape-WqlString $Matches[1]
+            $prefix = ConvertTo-WqlEscapedString $Matches[1]
             $Where = "Name LIKE '$prefix%'"
         }
         # Flexible regex for contains(Name, 'substring')
         elseif ($NameFilter -match "(?i)contains\s*\(\s*Name\s*,\s*['""]([^'""\)]*)['""]\s*\)") {
-            $contains = Escape-WqlString $Matches[1]
+            $contains = ConvertTo-WqlEscapedString $Matches[1]
             $Where = "Name LIKE '%$contains%'"
         }
         else {
@@ -1547,7 +1549,7 @@ function Remove-CMPackage {
     }
 }
 
-function Ensure-CMFolderPath {
+function Resolve-CMFolderPath {
     <#
     .SYNOPSIS
         Ensures an SCCM console folder path exists (CIM/DCOM).
@@ -1574,7 +1576,7 @@ function Ensure-CMFolderPath {
     $Parts = $Path -split "\\\\" | Where-Object { $_ -and $_.Trim() }
 
     foreach ($Part in $Parts) {
-        $EscPart = Escape-WqlString $Part
+        $EscPart = ConvertTo-WqlEscapedString $Part
         $Node = Get-CimInstance -CimSession $global:SCCMCimSession -Namespace $Namespace `
             -ClassName "SMS_ObjectContainerNode" `
             -Filter "Name = '$EscPart' AND ParentContainerNodeID = $ParentId AND ObjectType = $ObjectType" `
@@ -1685,7 +1687,7 @@ function Invoke-ContentDistribution {
                 Write-LogEntry -Value "- Distributing via CIM/DCOM to '$DPGName'" -Severity 1
                 try {
                     $Namespace = Get-SCCMNamespace
-                    $EscDPG = Escape-WqlString $DPGName
+                    $EscDPG = ConvertTo-WqlEscapedString $DPGName
                     $DPGroupObj = Get-CimInstance -CimSession $global:SCCMCimSession -Namespace $Namespace `
                         -ClassName "SMS_DistributionPointGroup" -Filter "Name = '$EscDPG'" -ErrorAction Stop
 
@@ -2982,7 +2984,7 @@ function Get-LenovoDrivers {
         }
 
         # Filter by provided partial info
-        $PackResults = Filter-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
+        $PackResults = Select-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
         if (-not $PackResults) {
             Write-LogEntry -Value "[Warning] - No driver packs found matching '$Model' for specified OS criteria." -Severity 2
             return
@@ -2997,15 +2999,9 @@ function Get-LenovoDrivers {
             ModelName,
         os,
         @{ Expression = {
-                $ver = $_.version
-                if (-not $ver) { return [int]::MaxValue }
-                if ($ver -match '^(\d{2})H([12])$') {
-                    return ((2000 + [int]$Matches[1]) * 10) + [int]$Matches[2]
-                }
-                elseif ($ver -match '^\d{4}$') {
-                    return [int]$ver
-                }
-                return [int]::MaxValue
+                $key = Get-OSVersionSortKey -OSVersion $_.version
+                if ($key -eq 0) { return [int]::MaxValue }
+                return $key
             } 
         },
         @{ Expression = { $_.version } }
@@ -3175,7 +3171,7 @@ function Get-LenovoDrivers {
     $PackageID = $NewPackage.PackageID
 
     # Place package into "Driver Packages\Lenovo" console folder
-    $FolderNodeId = Ensure-CMFolderPath -Path "Driver Packages\\Lenovo" -ObjectType 2
+    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\Lenovo" -ObjectType 2
     if ($FolderNodeId) {
         if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
             Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\Lenovo" -Severity 1
@@ -3185,7 +3181,7 @@ function Get-LenovoDrivers {
     # 11. Remove older packages for the same model + OS family after successful import
     if ($PackageID) {
         $BasePrefix = "Drivers - Lenovo $Model - $OSDisplay "
-        $EscPrefix = Escape-WqlString $BasePrefix
+        $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
         $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
         $OldPackages = $PostPackages | Where-Object {
             $_.PackageID -ne $PackageID -and
@@ -3408,7 +3404,7 @@ function Get-DellDrivers {
         }
 
         # Filter by provided partial info
-        $PackResults = Filter-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
+        $PackResults = Select-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
         if (-not $PackResults) {
             Write-LogEntry -Value "[Warning] - No driver packs found matching '$Model' for specified OS criteria." -Severity 2
             return
@@ -3423,15 +3419,9 @@ function Get-DellDrivers {
             ModelName,
         WindowsName,
         @{ Expression = {
-                $ver = $_.version
-                if (-not $ver) { return [int]::MaxValue }
-                if ($ver -match '^(\d{2})H([12])$') {
-                    return ((2000 + [int]$Matches[1]) * 10) + [int]$Matches[2]
-                }
-                elseif ($ver -match '^\d{4}$') {
-                    return [int]$ver
-                }
-                return [int]::MaxValue
+                $key = Get-OSVersionSortKey -OSVersion $_.version
+                if ($key -eq 0) { return [int]::MaxValue }
+                return $key
             } 
         },
         @{ Expression = { $_.version } }
@@ -3448,7 +3438,6 @@ function Get-DellDrivers {
         $OSVersion = $SelectedPack.version
         $SelectedPackOsName = $SelectedPack.WindowsName
         $SelectedPackArch = $SelectedPack.Architecture
-        $SelectedPackDate = $SelectedPack.DateCompact
         $ModelTypes = $SelectedPack.ModelTypes
         $OSName = $SelectedPackOsName
         $Architecture = $SelectedPackArch
@@ -3638,7 +3627,7 @@ function Get-DellDrivers {
     $PackageID = $NewPackage.PackageID
 
     # Place package into "Driver Packages\Dell" console folder
-    $FolderNodeId = Ensure-CMFolderPath -Path "Driver Packages\\Dell" -ObjectType 2
+    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\Dell" -ObjectType 2
     if ($FolderNodeId) {
         if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
             Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\Dell" -Severity 1
@@ -3648,7 +3637,7 @@ function Get-DellDrivers {
     # 11. Remove older packages for the same model + OS family after successful import
     if ($PackageID) {
         $BasePrefix = "Drivers - Dell $Model - $OSDisplay "
-        $EscPrefix = Escape-WqlString $BasePrefix
+        $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
         $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
         $OldPackages = $PostPackages | Where-Object {
             $_.PackageID -ne $PackageID -and
@@ -3797,19 +3786,7 @@ function Get-HPDrivers {
     function Get-HPOSSortKey {
         param([string]$OsName, [string]$OsVersion)
         $family = if ($OsName -match "11") { 11 } else { 10 }
-
-        $versionKey = 0
-        if ($OsVersion) {
-            if ($OsVersion -match '^(\d{2})H([12])$') {
-                # e.g. 22H2 → (2022 * 10) + 2 = 20222
-                $versionKey = ((2000 + [int]$Matches[1]) * 10) + [int]$Matches[2]
-            }
-            elseif ($OsVersion -match '^\d{4}$') {
-                # Legacy 4-digit builds: 1909 → 1909, 2009 → 2009
-                $versionKey = [int]$OsVersion
-            }
-        }
-
+        $versionKey = Get-OSVersionSortKey -OSVersion $OsVersion
         return ($family * 100000) + $versionKey
     }
 
@@ -3943,7 +3920,7 @@ function Get-HPDrivers {
         }
 
         # Filter by provided partial info
-        $PackResults = Filter-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
+        $PackResults = Select-DriverPackResults -PackResults $PackResults -OSName $OSName -OSVersion $OSVersion -OsFamilyNameProperty 'WindowsName' -OsVersionProperty 'version'
         if (-not $PackResults) {
             Write-LogEntry -Value "[Warning] - No driver packs found matching '$Model' for specified OS criteria." -Severity 2
             return
@@ -3970,7 +3947,6 @@ function Get-HPDrivers {
         $OSVersion = $SelectedPack.version
         $OSName = $SelectedPack.WindowsName
         $Architecture = $SelectedPack.Architecture
-        $SelectedPackDate = $SelectedPack.DateCompact
         $ModelTypes = $SelectedPack.ModelTypes
     }
 
@@ -4189,7 +4165,7 @@ function Get-HPDrivers {
     $PackageID = $NewPackage.PackageID
 
     # Place package into "Driver Packages\HP" console folder
-    $FolderNodeId = Ensure-CMFolderPath -Path "Driver Packages\\HP" -ObjectType 2
+    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\HP" -ObjectType 2
     if ($FolderNodeId) {
         if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
             Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\HP" -Severity 1
@@ -4200,7 +4176,7 @@ function Get-HPDrivers {
     # 12. Remove stale packages for the same model + OS family
     # -------------------------------------------------------------------------
     $BasePrefix = "Drivers - HP $DisplayModel - $OSDisplay "
-    $EscPrefix = Escape-WqlString $BasePrefix
+    $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
     $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
     $OldPackages = $PostPackages | Where-Object {
         $_.PackageID -ne $PackageID -and
@@ -4402,7 +4378,6 @@ function Get-MicrosoftDrivers {
     $EffectivePackageFormat = if ($PSBoundParameters.ContainsKey('PackageFormat')) { $PackageFormat } else { $Settings.PackageFormat }
     $SiteServer = $Settings.SiteServer
     $PackagePath = $Settings.PackagePath
-    $Architecture = "x64"
 
     # 2. Connect to ConfigMgr
     if (-not (Initialize-SCCMConnection)) {
@@ -4570,7 +4545,7 @@ function Get-MicrosoftDrivers {
 
     # 15. Place package into "Driver Packages\Microsoft" console folder
     $ConsoleFolder = "Driver Packages\\Microsoft"
-    $FolderNodeId = Ensure-CMFolderPath -Path $ConsoleFolder -ObjectType 2
+    $FolderNodeId = Resolve-CMFolderPath -Path $ConsoleFolder -ObjectType 2
     if ($FolderNodeId) {
         if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
             Write-LogEntry -Value "- Package $PackageID placed in console folder: $ConsoleFolder" -Severity 1
@@ -4798,7 +4773,7 @@ function Get-CustomDrivers {
 
     # Place package into "Driver Packages\<Manufacturer>" console folder
     $ConsoleFolder = "Driver Packages\\$Manufacturer"
-    $FolderNodeId = Ensure-CMFolderPath -Path $ConsoleFolder -ObjectType 2
+    $FolderNodeId = Resolve-CMFolderPath -Path $ConsoleFolder -ObjectType 2
     if ($FolderNodeId) {
         if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
             Write-LogEntry -Value "- Package $PackageID placed in console folder: $ConsoleFolder" -Severity 1
@@ -4972,7 +4947,6 @@ function Update-Packages {
                     $catalogModel = $global:LenovoModelDrivers | Where-Object { $_.Name -eq $modelOrSku } | Select-Object -First 1
                     if ($catalogModel -and $catalogModel.SCCM) {
                         # Match by OS version (e.g. "Windows 11 23H2" -> os=win11, version=23H2)
-                        $osMatch = $osPart -match 'Windows\s*10|Windows\s*11'
                         $versionMatch = $osPart -match '(\d{2}H\d)'
                         $catalogOs = if ($osPart -match '11') { 'win11' } else { 'win10' }
                         $catalogVersion = if ($versionMatch) { $matches[1] } else { "" }
@@ -5089,7 +5063,6 @@ function Start-DriverAutomationCLI {
         $connected = if ($global:ConfigMgrValidation -and $global:SiteServer) { "$global:SiteServer" } else { "Not connected" }
         Write-Host ""
         Write-Host "    Connected:  $connected" -ForegroundColor Gray
-        # Catalog freshness
         $catalogAge = @()
         $catalogMap = @(
             @{ File = $global:LenovoXMLFile; Name = "Lenovo" },
@@ -5098,12 +5071,11 @@ function Start-DriverAutomationCLI {
             @{ File = $global:MicrosoftJSONFile; Name = "Microsoft" }
         )
         foreach ($entry in $catalogMap) {
-            if ($entry.File) {
-                $path = Join-Path $global:TempDirectory $entry.File
-                if (Test-Path $path) {
-                    $age = [math]::Round((New-TimeSpan -Start (Get-Item $path).LastWriteTime -End (Get-Date)).TotalHours, 1)
-                    $catalogAge += "$($entry.Name) ${age}h"
-                }
+            if (-not $entry.File) { continue }
+            $path = Join-Path $global:TempDirectory $entry.File
+            if (Test-Path $path) {
+                $age = [math]::Round((New-TimeSpan -Start (Get-Item $path).LastWriteTime -End (Get-Date)).TotalHours, 1)
+                $catalogAge += "$($entry.Name) ${age}h"
             }
         }
         if ($catalogAge.Count -gt 0) {
@@ -5134,6 +5106,182 @@ function Start-DriverAutomationCLI {
         }
         Write-Host "    [B] Back"
         return (Read-Host "  Selection")
+    }
+
+    function Format-PackDisplay {
+        param([psobject]$Pack)
+        $parts = @($Pack.Name)
+        if ($Pack.SKU) { $parts += "| $($Pack.SKU)" }
+        if ($Pack.OS) { $parts += "| $($Pack.OS)" }
+        if ($Pack.FileName) { $parts += "| $($Pack.FileName)" }
+        return ($parts -join ' ')
+    }
+
+    function Show-PackResults {
+        param([object[]]$Results)
+        for ($i = 0; $i -lt $Results.Count; $i++) {
+            Write-Host "    [$($i + 1)] $(Format-PackDisplay -Pack $Results[$i])"
+        }
+    }
+
+    function Select-PackFromResults {
+        param([object[]]$Results)
+        while ($true) {
+            Write-Host "    [S] Search again"
+            Write-Host "    [B] Back"
+            $selection = Read-Host "  Select pack number"
+            switch ($selection.ToUpper()) {
+                "B" { return [pscustomobject]@{ Action = "back"; Pack = $null } }
+                "S" { return [pscustomobject]@{ Action = "search"; Pack = $null } }
+                default {
+                    if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $Results.Count) {
+                        return [pscustomobject]@{ Action = "select"; Pack = $Results[[int]$selection - 1] }
+                    }
+                    Write-Host "  Invalid selection. Enter a pack number, S, or B." -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
+    function Invoke-CLIPackagePrecheck {
+        param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$Settings)
+        $packInput = if ($SelectedOEM.FindCmd) { Resolve-DriverPackageCheckInput -OEM $SelectedOEM.Label -SelectedModel $SelectedModel } else { $null }
+        $hasExistingPackage = $false
+
+        if ($Settings.SiteServer -and $SelectedOEM.FindCmd) {
+            Write-Host ""
+            Write-Host "  Checking for existing SCCM package..." -ForegroundColor Yellow
+            $pkgCheck = Test-DriverPackageExists -SiteServer $Settings.SiteServer -OEM $SelectedOEM.Label -SelectedModel $SelectedModel -TimeoutSec 10
+            if ($pkgCheck.CanCheck) {
+                Write-Host "  Checking for package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
+                if ($pkgCheck.ExistingPackage) {
+                    $hasExistingPackage = $true
+                    Write-Host "  Found existing SCCM package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
+                    Write-Host "  Package ID: $($pkgCheck.ExistingPackage.PackageID), Version: $($pkgCheck.ExistingPackage.Version)" -ForegroundColor Yellow
+                }
+                elseif ($pkgCheck.NewerPackage) {
+                    $hasExistingPackage = $true
+                    Write-Host "  Found newer package in SCCM for this model/OS family/arch: $($pkgCheck.NewerPackage.Name)" -ForegroundColor Yellow
+                    Write-Host "  Package ID: $($pkgCheck.NewerPackage.PackageID), Version: $($pkgCheck.NewerPackage.Version)" -ForegroundColor Yellow
+                    Write-Host "  Selected pack is older than existing content. Use Force to replace it." -ForegroundColor Yellow
+                }
+            }
+            elseif ($pkgCheck.Reason) {
+                Write-Host "  Package pre-check skipped: $($pkgCheck.Reason)" -ForegroundColor DarkYellow
+            }
+        }
+
+        return [pscustomobject]@{
+            PackInput          = $packInput
+            HasExistingPackage = $hasExistingPackage
+        }
+    }
+
+    function Select-PackAction {
+        param([psobject]$SelectedModel, [bool]$HasExistingPackage)
+        while ($true) {
+            Write-Host ""
+            Write-Host "  Selected: $(Format-PackDisplay -Pack $SelectedModel)" -ForegroundColor Green
+            if ($HasExistingPackage) {
+                Write-Host "    [F] Force update" -ForegroundColor Cyan
+            }
+            else {
+                Write-Host "    [D] Download" -ForegroundColor Cyan
+            }
+            Write-Host "    [S] Search again"
+            Write-Host "    [B] Back"
+
+            $confirm = Read-Host "  Selection"
+            if ($HasExistingPackage) {
+                switch ($confirm.ToUpper()) {
+                    "F" { return [pscustomobject]@{ Action = "start"; Force = $true } }
+                    "S" { return [pscustomobject]@{ Action = "search"; Force = $false } }
+                    "B" { return [pscustomobject]@{ Action = "back"; Force = $false } }
+                    default { Write-Host "  Invalid selection. Enter F, S, or B." -ForegroundColor Yellow }
+                }
+            }
+            else {
+                switch ($confirm.ToUpper()) {
+                    "D" { return [pscustomobject]@{ Action = "start"; Force = $false } }
+                    "S" { return [pscustomobject]@{ Action = "search"; Force = $false } }
+                    "B" { return [pscustomobject]@{ Action = "back"; Force = $false } }
+                    default { Write-Host "  Invalid selection. Enter D, S, or B." -ForegroundColor Yellow }
+                }
+            }
+        }
+    }
+
+    function Invoke-CLISelectedDownload {
+        param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$PackInput, [bool]$ForcePrompt)
+        Write-Host ""
+        Write-Host "  Starting $($SelectedOEM.Label) driver workflow..." -ForegroundColor Green
+        Write-Host ""
+
+        if ($SelectedOEM.Label -eq "Microsoft" -and $SelectedModel.SKU) {
+            $invokeParams = @{
+                Model   = $SelectedModel.Name
+                Product = $SelectedModel.SKU
+            }
+            if ($PackInput) {
+                if ($PackInput.OSName) { $invokeParams.OSName = $PackInput.OSName }
+                if ($PackInput.OSVersion) { $invokeParams.OSVersion = $PackInput.OSVersion }
+            }
+            if ($ForcePrompt) { $invokeParams.Force = $true }
+            & $SelectedOEM.GetCmd @invokeParams
+        }
+        else {
+            $invokeParams = @{ Model = $SelectedModel.Name }
+            if ($PackInput) {
+                if ($PackInput.OSName) { $invokeParams.OSName = $PackInput.OSName }
+                if ($PackInput.OSVersion) { $invokeParams.OSVersion = $PackInput.OSVersion }
+                if ($PackInput.Architecture) { $invokeParams.Architecture = $PackInput.Architecture }
+            }
+            if ($ForcePrompt) { $invokeParams.Force = $true }
+            & $SelectedOEM.GetCmd @invokeParams
+        }
+
+        Read-Host "  Press Enter to continue"
+    }
+
+    function Invoke-CLIDownloadSearchFlow {
+        param([hashtable]$SelectedOEM, [psobject]$Settings)
+        while ($true) {
+            Show-Header -Breadcrumb "Download Drivers > $($SelectedOEM.Label)"
+            Write-Host ""
+            $searchTerm = Read-Host "  Enter model search (B=Back, Q=Quit)"
+            switch ($searchTerm.ToUpper()) {
+                "B" { return "back" }
+                "Q" { return "quit" }
+                "" { continue }
+            }
+
+            Write-Host ""
+            $results = & $SelectedOEM.FindCmd -Model $searchTerm
+            if (-not $results) {
+                Write-Host "  No models found matching '$searchTerm'." -ForegroundColor Yellow
+                Write-Host "    [S] Search again" -ForegroundColor Cyan
+                Write-Host "    [B] Back"
+                $action = Read-Host "  Selection"
+                if ($action.ToUpper() -eq "B") { return "back" }
+                continue
+            }
+
+            Write-Host "  Found $($results.Count) matching pack(s):" -ForegroundColor Green
+            Write-Host ""
+            Show-PackResults -Results $results
+            Write-Host ""
+
+            $selected = Select-PackFromResults -Results $results
+            if ($selected.Action -eq "search" -or $selected.Action -eq "back") { continue }
+            if (-not $selected.Pack) { continue }
+
+            $precheck = Invoke-CLIPackagePrecheck -SelectedOEM $SelectedOEM -SelectedModel $selected.Pack -Settings $Settings
+            $actionResult = Select-PackAction -SelectedModel $selected.Pack -HasExistingPackage $precheck.HasExistingPackage
+            if ($actionResult.Action -eq "search" -or $actionResult.Action -eq "back") { continue }
+
+            Invoke-CLISelectedDownload -SelectedOEM $SelectedOEM -SelectedModel $selected.Pack -PackInput $precheck.PackInput -ForcePrompt $actionResult.Force
+            return "done"
+        }
     }
 
     while ($true) {
@@ -5176,308 +5324,143 @@ function Start-DriverAutomationCLI {
                 }
             }
             "2" {
-                $oemChoice = Show-OEMMenu -Action "Download Drivers" -Breadcrumb "Download Drivers"
-                if ($oemChoice -match '^\d+$' -and [int]$oemChoice -ge 1 -and [int]$oemChoice -le 5) {
-                    $selectedOEM = $OEMMenu[[int]$oemChoice - 1]
-                    $Settings = Get-DASettings
-
-                    # Custom: delegate everything to Get-CustomDrivers, which handles
-                    # prompts, Force Y/N, and SCCM package creation internally.
-                    if (-not $selectedOEM.FindCmd) {
+                try {
+                    $oemChoice = Show-OEMMenu -Action "Download Drivers" -Breadcrumb "Download Drivers"
+                    if ($oemChoice -match '^\d+$' -and [int]$oemChoice -ge 1 -and [int]$oemChoice -le 5) {
+                        $selectedOEM = $OEMMenu[[int]$oemChoice - 1]
+                        $settings = Get-DASettings
+                        if (-not $selectedOEM.FindCmd) {
+                            Write-Host ""
+                            Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
+                            Write-Host ""
+                            & $selectedOEM.GetCmd
+                            Read-Host "  Press Enter to continue"
+                        }
+                        else {
+                            $flowResult = Invoke-CLIDownloadSearchFlow -SelectedOEM $selectedOEM -Settings $settings
+                            if ($flowResult -eq "quit") { return }
+                        }
+                    }
+                }
+                catch {
+                    Write-LogEntry -Value "[Error] - Download Drivers menu failed: $($_.Exception.Message)" -Severity 3
+                    Write-Host ""
+                    Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
+                    Read-Host "  Press Enter to continue"
+                }
+            }
+            "3" {
+                Write-Host ""
+                Write-Host "  Starting custom driver package creation..." -ForegroundColor Green
+                Write-Host ""
+                Get-CustomDrivers
+                Read-Host "  Press Enter to continue"
+            }
+            "4" {
+                $pkgMenuLoop = $true
+                while ($pkgMenuLoop) {
+                    $pkgChoice = Show-SubMenu -Title "Browse Packages" -Items @("Browse Packages", "Check for Updates") -Breadcrumb "Browse Packages"
+                    if ($pkgChoice -eq "1") {
+                        $filterLoop = $true
+                        while ($filterLoop) {
+                            $makeChoice = Show-SubMenu -Title "Filter by OEM" -Items @("All OEMs", "Lenovo", "Dell", "HP", "Microsoft", "Custom") -Breadcrumb "Browse Packages > Filter"
+                            if ($makeChoice -match '^[1-6]$') {
+                                $makeMap = @{ "1" = "All"; "2" = "Lenovo"; "3" = "Dell"; "4" = "HP"; "5" = "Microsoft"; "6" = "Custom" }
+                                Write-Host ""
+                                $packages = Get-Packages -Make $makeMap[$makeChoice]
+                                if ($packages) {
+                                    $packages | Format-Table -AutoSize
+                                }
+                                else {
+                                    Write-Host "  No packages found." -ForegroundColor Yellow
+                                }
+                                Read-Host "  Press Enter to continue"
+                            }
+                            elseif ($makeChoice -eq "B") {
+                                $filterLoop = $false
+                            }
+                        }
+                    }
+                    elseif ($pkgChoice -eq "2") {
                         Write-Host ""
-                        Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
+                        Write-Host "  Checking packages against catalog versions..." -ForegroundColor Green
                         Write-Host ""
-                        & $selectedOEM.GetCmd
+                        Update-Packages -HighlightUpdates
                         Read-Host "  Press Enter to continue"
                     }
-                    else {
-                        # Search loop with B/Q support
-                        :searchLoop while ($true) {
-                            Show-Header -Breadcrumb "Download Drivers > $($selectedOEM.Label)"
-                            Write-Host ""
-                            $searchTerm = Read-Host "  Enter model search (B=Back, Q=Quit)"
-                            switch ($searchTerm.ToUpper()) {
-                                "B" { break searchLoop }
-                                "Q" { return }
-                                "" { continue searchLoop }
-                                default {
-                                    Write-Host ""
-                                    $results = & $selectedOEM.FindCmd -Model $searchTerm
-                                    if ($results) {
-                                        Write-Host "  Found $($results.Count) matching pack(s):" -ForegroundColor Green
-                                        Write-Host ""
-                                        # Display numbered results
-                                        for ($i = 0; $i -lt $results.Count; $i++) {
-                                            $r = $results[$i]
-                                            $parts = @("[$($i + 1)]", $r.Name)
-                                            if ($r.SKU) { $parts += "| $($r.SKU)" }
-                                            if ($r.OS) { $parts += "| $($r.OS)" }
-                                            if ($r.FileName) { $parts += "| $($r.FileName)" }
-                                            Write-Host "    $($parts -join ' ')"
-                                        }
-                                        Write-Host ""
-                                        $selectedModel = $null
-                                        :packSelectionLoop while ($true) {
-                                            Write-Host "    [S] Search again"
-                                            Write-Host "    [B] Back"
-                                            $selection = Read-Host "  Select pack number"
-                                            switch ($selection.ToUpper()) {
-                                                "B" { continue searchLoop }
-                                                "S" { continue searchLoop }
-                                                default {
-                                                    if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $results.Count) {
-                                                        $selectedModel = $results[[int]$selection - 1]
-                                                        break packSelectionLoop
-                                                    }
-                                                    Write-Host "  Invalid selection. Enter a pack number, S, or B." -ForegroundColor Yellow
-                                                }
-                                            }
-                                        }
-
-                                        if (-not $selectedModel) { continue searchLoop }
-
-                                        $forcePrompt = $false
-                                        $packInput = $null
-                                        $pkgCheck = $null
-                                        $hasExistingPackage = $false
-                                        if ($selectedOEM.FindCmd) {
-                                            $packInput = Resolve-DriverPackageCheckInput -OEM $selectedOEM.Label -SelectedModel $selectedModel
-                                        }
-                                            if ($Settings.SiteServer -and $selectedOEM.FindCmd) {
-                                                Write-Host ""
-                                                Write-Host "  Checking for existing SCCM package..." -ForegroundColor Yellow
-                                                $pkgCheck = Test-DriverPackageExists -SiteServer $Settings.SiteServer -OEM $selectedOEM.Label -SelectedModel $selectedModel -TimeoutSec 10
-                                                if ($pkgCheck.CanCheck) {
-                                                    Write-Host "  Checking for package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
-                                                    if ($pkgCheck.ExistingPackage) {
-                                                        $hasExistingPackage = $true
-                                                        Write-Host "  Found existing SCCM package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
-                                                        Write-Host "  Package ID: $($pkgCheck.ExistingPackage.PackageID), Version: $($pkgCheck.ExistingPackage.Version)" -ForegroundColor Yellow
-                                                    }
-                                                    elseif ($pkgCheck.NewerPackage) {
-                                                        $hasExistingPackage = $true
-                                                        Write-Host "  Found newer package in SCCM for this model/OS family/arch: $($pkgCheck.NewerPackage.Name)" -ForegroundColor Yellow
-                                                        Write-Host "  Package ID: $($pkgCheck.NewerPackage.PackageID), Version: $($pkgCheck.NewerPackage.Version)" -ForegroundColor Yellow
-                                                        Write-Host "  Selected pack is older than existing content. Use Force to replace it." -ForegroundColor Yellow
-                                                    }
-                                                }
-                                                elseif ($pkgCheck.Reason) {
-                                                    Write-Host "  Package pre-check skipped: $($pkgCheck.Reason)" -ForegroundColor DarkYellow
-                                                }
-                                            }
-
-                                        :packActionLoop while ($true) {
-                                            $startWorkflow = $false
-                                            Write-Host ""
-                                            $selectedParts = @($selectedModel.Name)
-                                            if ($selectedModel.SKU) { $selectedParts += "| $($selectedModel.SKU)" }
-                                            if ($selectedModel.OS) { $selectedParts += "| $($selectedModel.OS)" }
-                                            if ($selectedModel.FileName) { $selectedParts += "| $($selectedModel.FileName)" }
-                                            Write-Host "  Selected: $($selectedParts -join ' ')" -ForegroundColor Green
-                                            if ($hasExistingPackage) {
-                                                Write-Host "    [F] Force update" -ForegroundColor Cyan
-                                            }
-                                            else {
-                                                Write-Host "    [D] Download" -ForegroundColor Cyan
-                                            }
-                                            Write-Host "    [S] Search again"
-                                            Write-Host "    [B] Back"
-                                            $confirm = Read-Host "  Selection"
-                                            if ($hasExistingPackage) {
-                                                switch ($confirm.ToUpper()) {
-                                                    "F" {
-                                                        $forcePrompt = $true
-                                                        $startWorkflow = $true
-                                                    }
-                                                    "B" { continue searchLoop }
-                                                    "S" { continue searchLoop }
-                                                    default {
-                                                        Write-Host "  Invalid selection. Enter F, S, or B." -ForegroundColor Yellow
-                                                    }
-                                                }
-                                            }
-                                            else {
-                                                switch ($confirm.ToUpper()) {
-                                                    "D" {
-                                                        $forcePrompt = $false
-                                                        $startWorkflow = $true
-                                                    }
-                                                    "B" { continue searchLoop }
-                                                    "S" { continue searchLoop }
-                                                    default {
-                                                        Write-Host "  Invalid selection. Enter D, S, or B." -ForegroundColor Yellow
-                                                    }
-                                                }
-                                            }
-
-                                            if (-not $startWorkflow) { continue packActionLoop }
-
-                                            Write-Host ""
-                                            Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
-                                            Write-Host ""
-                                            if ($selectedOEM.Label -eq "Microsoft" -and $selectedModel.SKU) {
-                                                $invokeParams = @{
-                                                    Model   = $selectedModel.Name
-                                                    Product = $selectedModel.SKU
-                                                }
-                                                if ($packInput) {
-                                                    if ($packInput.OSName) { $invokeParams.OSName = $packInput.OSName }
-                                                    if ($packInput.OSVersion) { $invokeParams.OSVersion = $packInput.OSVersion }
-                                                }
-                                                if ($forcePrompt) { $invokeParams.Force = $true }
-
-                                                & $selectedOEM.GetCmd @invokeParams
-                                            }
-                                            else {
-                                                $invokeParams = @{
-                                                    Model = $selectedModel.Name
-                                                }
-                                                if ($packInput) {
-                                                    if ($packInput.OSName) { $invokeParams.OSName = $packInput.OSName }
-                                                    if ($packInput.OSVersion) { $invokeParams.OSVersion = $packInput.OSVersion }
-                                                    if ($packInput.Architecture) { $invokeParams.Architecture = $packInput.Architecture }
-                                                }
-                                                if ($forcePrompt) { $invokeParams.Force = $true }
-
-                                                & $selectedOEM.GetCmd @invokeParams
-                                            }
-                                            Read-Host "  Press Enter to continue"
-                                            break searchLoop
-                                        }
-                                    }
-                                    else {
-                                        Write-Host ""
-                                        Write-Host "  No models found matching '$searchTerm'." -ForegroundColor Yellow
-                                        Write-Host "    [S] Search again" -ForegroundColor Cyan
-                                        Write-Host "    [B] Back"
-                                        $action = Read-Host "  Selection"
-                                        if ($action.ToUpper() -eq "B") { break searchLoop }
-                                        # Otherwise loop back to search
-                                    }
-                                }
-                            }
-                        }
+                    elseif ($pkgChoice -eq "B") {
+                        $pkgMenuLoop = $false
                     }
                 }
             }
-        "3" {
-            Write-Host ""
-            Write-Host "  Starting custom driver package creation..." -ForegroundColor Green
-            Write-Host ""
-            Get-CustomDrivers
-            Read-Host "  Press Enter to continue"
-        }
-        "4" {
-            $pkgMenuLoop = $true
-            while ($pkgMenuLoop) {
-                $pkgChoice = Show-SubMenu -Title "Browse Packages" -Items @("Browse Packages", "Check for Updates") -Breadcrumb "Browse Packages"
-                if ($pkgChoice -eq "1") {
-                    $filterLoop = $true
-                    while ($filterLoop) {
-                        $makeChoice = Show-SubMenu -Title "Filter by OEM" -Items @("All OEMs", "Lenovo", "Dell", "HP", "Microsoft", "Custom") -Breadcrumb "Browse Packages > Filter"
-                        if ($makeChoice -match '^[1-6]$') {
-                            $makeMap = @{ "1" = "All"; "2" = "Lenovo"; "3" = "Dell"; "4" = "HP"; "5" = "Microsoft"; "6" = "Custom" }
-                            Write-Host ""
-                            $packages = Get-Packages -Make $makeMap[$makeChoice]
-                            if ($packages) {
-                                $packages | Format-Table -AutoSize
-                            }
-                            else {
-                                Write-Host "  No packages found." -ForegroundColor Yellow
-                            }
-                            Read-Host "  Press Enter to continue"
-                            # Stay in filter menu
-                        }
-                        elseif ($makeChoice -eq "B") {
-                            $filterLoop = $false
-                        }
+            "5" {
+                $settingsChoice = Show-SubMenu -Title "Settings" -Items @("View Settings", "Configure Settings", "Refresh Catalogs") -Breadcrumb "Settings"
+                if ($settingsChoice -eq "1") {
+                    Write-Host ""
+                    $settings = Get-DASettings
+                    if ($settings) {
+                        $settings | Format-List
+                    }
+                    Write-Host "  [1] Modify Settings" -ForegroundColor Cyan
+                    Write-Host "  [B] Back to menu"
+                    $afterView = Read-Host "  Selection"
+                    if ($afterView -eq "1") {
+                        Write-Host ""
+                        Write-Host "  Launching interactive settings configuration..." -ForegroundColor Green
+                        Write-Host ""
+                        Set-DASettings
                     }
                 }
-                elseif ($pkgChoice -eq "2") {
-                    Write-Host ""
-                    Write-Host "  Checking packages against catalog versions..." -ForegroundColor Green
-                    Write-Host ""
-                    Update-Packages -HighlightUpdates
-                    Read-Host "  Press Enter to continue"
-                    # Stay in Browse Packages menu
-                }
-                elseif ($pkgChoice -eq "B") {
-                    $pkgMenuLoop = $false
-                }
-            }
-        }
-        "5" {
-            $settingsChoice = Show-SubMenu -Title "Settings" -Items @("View Settings", "Configure Settings", "Refresh Catalogs") -Breadcrumb "Settings"
-            if ($settingsChoice -eq "1") {
-                Write-Host ""
-                $settings = Get-DASettings
-                if ($settings) {
-                    $settings | Format-List
-                }
-                Write-Host "  [1] Modify Settings" -ForegroundColor Cyan
-                Write-Host "  [B] Back to menu"
-                $afterView = Read-Host "  Selection"
-                if ($afterView -eq "1") {
+                elseif ($settingsChoice -eq "2") {
                     Write-Host ""
                     Write-Host "  Launching interactive settings configuration..." -ForegroundColor Green
                     Write-Host ""
                     Set-DASettings
                 }
-            }
-            elseif ($settingsChoice -eq "2") {
-                Write-Host ""
-                Write-Host "  Launching interactive settings configuration..." -ForegroundColor Green
-                Write-Host ""
-                Set-DASettings
-            }
-            elseif ($settingsChoice -eq "3") {
-                Write-Host ""
-                Write-Host "  Forcing catalog refresh for all OEMs..." -ForegroundColor Green
-                Write-Host ""
-                # Clear cached data to force re-download
-                $global:LenovoModelXML = $null
-                $global:LenovoModelDrivers = $null
-                $global:DellModelXML = $null
-                $global:DellModelDrivers = $null
-                $global:HPModelXML = $null
-                $global:HPModelDrivers = $null
-                $global:MicrosoftModelDrivers = $null
-                # Delete cached files (XML and CAB)
-                foreach ($file in @($global:LenovoXMLFile, $global:LenovoXMLCabFile, $global:DellXMLFile, $global:DellXMLCabFile, $global:HPXMLFile, $global:HPXMLCabFile, $global:MicrosoftJSONFile)) {
-                    if ($file) {
-                        $path = Join-Path $global:TempDirectory $file
-                        if (Test-Path $path) {
-                            Remove-Item $path -Force -ErrorAction SilentlyContinue
+                elseif ($settingsChoice -eq "3") {
+                    Write-Host ""
+                    Write-Host "  Forcing catalog refresh for all OEMs..." -ForegroundColor Green
+                    Write-Host ""
+                    $global:LenovoModelXML = $null
+                    $global:LenovoModelDrivers = $null
+                    $global:DellModelXML = $null
+                    $global:DellModelDrivers = $null
+                    $global:HPModelXML = $null
+                    $global:HPModelDrivers = $null
+                    $global:MicrosoftModelDrivers = $null
+                    foreach ($file in @($global:LenovoXMLFile, $global:LenovoXMLCabFile, $global:DellXMLFile, $global:DellXMLCabFile, $global:HPXMLFile, $global:HPXMLCabFile, $global:MicrosoftJSONFile)) {
+                        if ($file) {
+                            $path = Join-Path $global:TempDirectory $file
+                            if (Test-Path $path) {
+                                Remove-Item $path -Force -ErrorAction SilentlyContinue
+                            }
                         }
                     }
+                    Write-Host "  Downloading Lenovo catalog..." -ForegroundColor Cyan
+                    Find-LenovoModel -Model "*" | Out-Null
+                    Write-Host "  Downloading Dell catalog..." -ForegroundColor Cyan
+                    Find-DellModel -Model "*" | Out-Null
+                    Write-Host "  Downloading HP catalog..." -ForegroundColor Cyan
+                    Find-HPModel -Model "*" | Out-Null
+                    Write-Host "  Downloading Microsoft catalog..." -ForegroundColor Cyan
+                    Find-MicrosoftModel -Model "*" | Out-Null
+                    Write-Host ""
+                    Write-Host "  All catalogs refreshed." -ForegroundColor Green
+                    Read-Host "  Press Enter to continue"
                 }
-                # Force reload by calling each Find function
-                Write-Host "  Downloading Lenovo catalog..." -ForegroundColor Cyan
-                Find-LenovoModel -Model "*" | Out-Null
-                Write-Host "  Downloading Dell catalog..." -ForegroundColor Cyan
-                Find-DellModel -Model "*" | Out-Null
-                Write-Host "  Downloading HP catalog..." -ForegroundColor Cyan
-                Find-HPModel -Model "*" | Out-Null
-                Write-Host "  Downloading Microsoft catalog..." -ForegroundColor Cyan
-                Find-MicrosoftModel -Model "*" | Out-Null
-                Write-Host ""
-                Write-Host "  All catalogs refreshed." -ForegroundColor Green
-                Read-Host "  Press Enter to continue"
             }
-        }
-        "Q" {
-            Write-Host ""
-            Write-Host "  Goodbye." -ForegroundColor DarkCyan
-            return
-        }
-        default {
-            Write-Host "  Invalid selection." -ForegroundColor Red
-            Start-Sleep -Milliseconds 500
+            "Q" {
+                Write-Host ""
+                Write-Host "  Goodbye." -ForegroundColor DarkCyan
+                return
+            }
+            default {
+                Write-Host "  Invalid selection." -ForegroundColor Red
+                Start-Sleep -Milliseconds 500
+            }
         }
     }
 }
-}
-
 # Export functions - only user-facing commands
 Export-ModuleMember -Function @(
     # Settings
@@ -5504,3 +5487,5 @@ Export-ModuleMember -Function @(
     # Interactive CLI
     'Start-DriverAutomationCLI'
 )
+
+

@@ -2,12 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.2.0 - 2026-03-26
+- Refactored `Start-DriverAutomationCLI` into smaller internal helper flows (pack display, pack selection, pre-check, action selection, and invocation) to reduce nested logic and improve maintainability.
+- Added clearer structured download flow handling (`Invoke-CLIDownloadSearchFlow`) while preserving current CLI behavior.
+- Consolidated OS version sort logic across Lenovo, Dell, and HP selection paths by reusing `Get-OSVersionSortKey` (removed duplicated inline version parsing logic).
+- Updated CLI pre-check newer-version logic to run only when the selected pack has a parseable OS version token; otherwise it now falls back to exact-name existence checks.
+- Improved CLI action gating so users are guided to `F` (force) when existing/newer content is detected before download action is chosen.
+- Renamed internal helper functions to approved PowerShell verbs:
+  - `Ensure-CMFolderPath` -> `Resolve-CMFolderPath`
+  - `Escape-WqlString` -> `ConvertTo-WqlEscapedString`
+  - `Filter-DriverPackResults` -> `Select-DriverPackResults`
+
 ## 2.1.1 - 2026-03-26
 - Refactored CLI package pre-checks to use shared helpers (`Resolve-DriverPackageCheckInput`, `Test-DriverPackageExists`) to reduce naming drift and centralize package-name logic.
 - Fixed double-prompt behavior in CLI downloads by passing selected pack metadata (OS name/version and architecture) into `Get-*Drivers` so users are not asked to select the same pack twice.
 - Hardened CLI package pre-check connection handling to skip cleanly when no active SCCM CIM session exists, preventing noisy pre-check errors.
 - Updated Lenovo package version/revision source to prefer the XML `SCCM` node `date` value (compact format) instead of filename suffix parsing.
 - Added guaranteed cleanup for `DA_Stage_*` staging folders in `New-DriverPackage` using `finally`, preventing temp staging buildup in `DownloadPath`.
+- Updated Download Drivers OEM menu ordering to alphabetical for OEMs (`Dell`, `HP`, `Lenovo`, `Microsoft`) while keeping `Custom` and `Back` last.
+- Added stricter CLI input validation loops for pack selection and action prompts (invalid entries now re-prompt with guidance).
+- Updated post-search `B` behavior to return to the same OEM model-search screen instead of jumping back to the main menu.
+- Changed existing-package UX so availability of actions is determined before action prompt:
+  - New package path: `D / S / B`
+  - Existing package path: `F / S / B`
+- Enhanced pre-check logic to detect newer existing SCCM packages in the same model/OS family/architecture, preventing accidental downgrades from older selected packs.
 
 ## 2.1.0 - 2026-03-25
 - Added `Get-Packages` for listing existing driver packages in SCCM (filterable by OEM).

@@ -1,6 +1,6 @@
 # Driver Automation Tool
 
-Current version: **2.1.1**
+Current version: **2.2.0**
 See `CHANGELOG.md` for release history.
 
 A modular PowerShell CLI for automating driver pack download, extraction, SCCM package creation, and distribution. Supports Lenovo, Dell, HP, Microsoft Surface, and custom driver packages. Designed for ConfigMgr environments with an interactive menu-driven interface.
@@ -48,7 +48,7 @@ A modular PowerShell CLI for automating driver pack download, extraction, SCCM p
 The `Start-DriverAutomationCLI` command launches a menu-driven interface:
 
 ```
-  Driver Automation Tool 2.1.1 > Main Menu
+  Driver Automation Tool 2.2.0 > Main Menu
 
     Connected:  your.sccm.server
     Catalogs:   LenovoXML 3.2h | DellXML 3.2h | HPXML 3.2h | build-driverpack 3.2h
