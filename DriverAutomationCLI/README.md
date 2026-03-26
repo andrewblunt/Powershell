@@ -1,19 +1,20 @@
-# Driver Automation CLI (Lenovo)
+# Driver Automation Tool
 
-Current version: **1.3.1**  
+Current version: **2.1.1**
 See `CHANGELOG.md` for release history.
 
-A headless, modular PowerShell CLI for automating Lenovo driver pack download, extraction, SCCM package creation, and distribution. Designed for ConfigMgr environments and a CLI‑first workflow.
+A modular PowerShell CLI for automating driver pack download, extraction, SCCM package creation, and distribution. Supports Lenovo, Dell, HP, Microsoft Surface, and custom driver packages. Designed for ConfigMgr environments with an interactive menu-driven interface.
 
 ## Features
-- Lenovo driver pack search (catalog XML) with interactive selection.
-- Dell driver pack search (catalog CAB/XML) with interactive selection.
-- HP driver pack search (catalog CAB/XML) with interactive selection.
-- Downloads via BITS, extracts, stages, and packages to SCCM.
-- CIM/DCOM only (no AdminService, no WinRM).
-- Optional distribution to DP Groups.
-- Package source formats: Raw, Zip, or WIM.
-- Automatic cleanup of download/extract staging (optional).
+- **Interactive CLI** - Menu-driven interface for all operations
+- **Multi-OEM support** - Lenovo, Dell, HP, Microsoft Surface
+- **Custom driver packages** - Create packages from local driver folders
+- **Model search** - Search across individual OEMs or all at once
+- **Package management** - Browse and audit existing SCCM driver packages
+- **BITS downloads** - Resilient transfers with speed/ETA reporting
+- **Package formats** - Raw, Zip, or WIM
+- **CIM/DCOM only** - No AdminService, no WinRM required
+- **Configurable** - Settings stored in DASettings.json
 
 ## Requirements
 - Windows PowerShell 5.1+
@@ -22,101 +23,159 @@ A headless, modular PowerShell CLI for automating Lenovo driver pack download, e
 - DISM available (for WIM packaging)
 
 ## Quick Start
-1. Open PowerShell in this repo.
+
+1. Open PowerShell in this directory.
+
 2. Import the module:
    ```powershell
    Import-Module .\DriverAutomation.psm1 -Force
    ```
-3. Configure settings:
+
+3. Launch the interactive CLI:
    ```powershell
-   Set-DASettings -SiteServer "your.sccm.server" -PackagePath "\\server\share\drivers"
-   Set-DASettings -DPGroups @("Standard OSD Distribution")
+   Start-DriverAutomationCLI
    ```
-4. Run interactively (no model specified):
+
+   Or run `.\DriverAutomationCLI.ps1` directly.
+
+4. First-time setup will create `DASettings.json` with blank values. Configure via Settings menu or:
    ```powershell
-   Get-LenovoDrivers
+   Set-DASettings
    ```
+
+## Interactive CLI
+
+The `Start-DriverAutomationCLI` command launches a menu-driven interface:
+
+```
+  Driver Automation Tool 2.1.1 > Main Menu
+
+    Connected:  your.sccm.server
+    Catalogs:   LenovoXML 3.2h | DellXML 3.2h | HPXML 3.2h | build-driverpack 3.2h
+
+    [1] Model Lookup
+    [2] Download Drivers
+    [3] Create Custom Driver Package
+    [4] Browse Packages
+    [5] Settings
+    [Q] Quit
+```
+
+### Model Lookup
+Search for models across individual OEMs or all at once:
+- **Search all OEMs** - Uses `Find-DriverModel` to search Lenovo, Dell, HP, and Microsoft catalogs
+- **OEM-specific** - Search within a single OEM's catalog
+
+### Download Drivers
+Select an OEM to start the driver download workflow. The tool will:
+1. Search the catalog for your model
+2. Let you select the appropriate driver pack
+3. Download via BITS (with speed and ETA)
+4. Extract the drivers
+5. Create an SCCM package
+6. Distribute to DP Groups (optional)
+
+### Browse Packages
+View existing driver packages in your SCCM site, filterable by OEM.
 
 ## Settings (DASettings.json)
-Key settings you may want to adjust:
-- `SiteServer`: SCCM site server FQDN
-- `SiteCode`: SCCM site code
-- `SCCMNamespace`: WMI namespace override (e.g. `root\SMS\site_UN2`)
-- `PackagePath`: UNC path for package sources
-- `DownloadPath`: staging path (relative paths supported, e.g. `.\Temp`)
-- `Architecture`: default architecture (`x64`, `x86`)
-- `PackageFormat`: `Raw`, `Zip`, or `WIM`
-- `CleanupDownloadPath`: `true` or `false`
-- `DistributionPointGroups`: array of DP Group names
 
-## Common Commands
-Interactive selection:
-```powershell
-Get-LenovoDrivers
-```
+Key settings:
+- `SiteServer` - SCCM site server FQDN
+- `SiteCode` - SCCM site code (auto-detected on connection)
+- `SCCMNamespace` - WMI namespace override (e.g. `root\SMS\site_UN2`)
+- `PackagePath` - UNC path for package sources
+- `DownloadPath` - Staging path (relative paths supported, e.g. `.\Temp`)
+- `PackageFormat` - `Raw`, `Zip`, or `WIM`
+- `CleanupDownloadPath` - `true` or `false`
+- `DistributionPointGroups` - Array of DP Group names
+- `EnableBinaryDeltaReplication` - `true` or `false`
+- `DistributionPriority` - `Low`, `Medium`, or `High`
 
-Specify model and OS version:
-```powershell
-Get-LenovoDrivers -Model "ThinkPad X395" -OSVersion "24H2"
-```
+## Commands
 
-Dell example:
+### Driver Automation
 ```powershell
-Get-DellDrivers -Model "Latitude 7420" -OSVersion "23H2"
-```
-
-HP example:
-```powershell
-Get-HPDrivers -Model "EliteBook 840 G7" -OSVersion "23H2"
-```
-
-Force re‑import (removes existing SCCM package; archives old source folder):
-```powershell
+# Lenovo
+Get-LenovoDrivers -Model "ThinkPad X1 Carbon Gen 9" -OSVersion "23H2"
 Get-LenovoDrivers -Model "ThinkPad X395" -OSVersion "24H2" -Force
+
+# Dell
+Get-DellDrivers -Model "Latitude 7420" -OSVersion "23H2"
+
+# HP
+Get-HPDrivers -Model "EliteBook 840 G7" -OSVersion "23H2"
+
+# Microsoft Surface
+Get-MicrosoftDrivers -Model "Surface Pro 7" -OSName "Windows 11" -OSVersion "23H2"
+
+# Custom (interactive - prompts for all details)
+Get-CustomDrivers
 ```
 
-Set package format:
+### Model Search
 ```powershell
-Set-DASettings -PackageFormat Zip
+# Search individual OEMs
+Find-LenovoModel -Model "ThinkPad X1"
+Find-DellModel -Model "Latitude"
+Find-HPModel -Model "EliteBook"
+Find-MicrosoftModel -Model "Surface Pro"
+
+# Search all OEMs at once
+Find-DriverModel -Model "X1 Carbon"
 ```
 
-Enable cleanup:
+### Package Management
 ```powershell
-Set-DASettings -CleanupDownloadPath Yes
+# List all driver packages in SCCM
+Get-Packages
+
+# List packages for a specific OEM
+Get-Packages -Make Lenovo
+
+# Check for outdated packages
+Update-Packages
+Update-Packages -Make Dell
 ```
 
-## Module Commands
-User-facing functions exported by the module:
-- `Get-DASettings` — reads the current JSON settings.
-- `Set-DASettings` — updates JSON settings (interactive if no switches provided).
-- `Find-LenovoModel` — searches Lenovo catalog for model names.
-- `Get-LenovoDrivers` — main workflow: search, download, extract, package, and distribute.
-- `Find-DellModel` — searches Dell catalog for model names.
-- `Get-DellDrivers` — main workflow: search, download, extract, package, and distribute.
-- `Find-HPModel` — searches HP catalog for model names.
-- `Get-HPDrivers` — main workflow: search, download, extract, package, and distribute.
-- `Get-OEMLinks` — downloads/reads OEM links (Lenovo, Dell, HP, Microsoft).
+### Configuration
+```powershell
+# View current settings
+Get-DASettings
 
-Internal/advanced (not typically called directly):
-- `Get-CMPackage` — wrapper for package queries.
-- `New-CMPackage` — wrapper for package creation.
-- `Set-CMPackage` — wrapper for package updates.
-- `Get-CMPackageCim` — CIM/DCOM query for packages.
-- `New-CMPackageCim` — CIM/DCOM create package.
-- `Set-CMPackageCim` — CIM/DCOM update package.
+# Configure interactively
+Set-DASettings
+```
+
+## Exported Functions
+
+| Function | Description |
+|----------|-------------|
+| `Start-DriverAutomationCLI` | Interactive menu-driven interface |
+| `Get-LenovoDrivers` | Download and package Lenovo drivers |
+| `Find-LenovoModel` | Search Lenovo catalog |
+| `Get-DellDrivers` | Download and package Dell drivers |
+| `Find-DellModel` | Search Dell catalog |
+| `Get-HPDrivers` | Download and package HP drivers |
+| `Find-HPModel` | Search HP catalog |
+| `Get-MicrosoftDrivers` | Download and package Microsoft Surface drivers |
+| `Find-MicrosoftModel` | Search Microsoft catalog |
+| `Get-CustomDrivers` | Create custom driver package from local folder |
+| `Get-Packages` | List SCCM driver packages |
+| `Find-DriverModel` | Search all OEM catalogs |
+| `Update-Packages` | Check packages against catalog versions |
+| `Get-DASettings` | View current settings |
+| `Set-DASettings` | Configure settings |
 
 ## Notes
-- Lenovo catalog XML is cached in `DownloadPath` and refreshed if older than 1 day.
-- Lenovo catalog is retrieved as XML (no CAB dependency).
-- Dell catalog CAB/XML is cached in `DownloadPath` and refreshed if older than 1 day.
-- HP catalog CAB/XML is cached in `DownloadPath` and refreshed if older than 1 day.
-- Package names follow:
-  `Drivers - <Manufacturer> <Model> - Windows <Version> <Arch>`
-- Package source folders use no spaces in folder names (for file paths only).
+- All OEM catalogs are cached in `DownloadPath` and refreshed if older than 7 days
+- Package names follow: `Drivers - <Manufacturer> <Model> - Windows <Version> <Arch>`
+- Microsoft packages use SKU (Product ID) for folder/naming to avoid collisions between variants
+- Lenovo package versioning uses catalog XML `SCCM` date metadata when available
+- Logs are written to the `Logs/` directory in CMTrace format
 
 ## Troubleshooting
-- If CIM/DCOM fails, confirm RPC/DCOM access and credentials.
-- If namespace errors occur, set `SCCMNamespace` in `DASettings.json`.
-
-## License
-Add your preferred license here.
+- If CIM/DCOM fails, confirm RPC/DCOM access and credentials
+- If namespace errors occur, set `SCCMNamespace` in `DASettings.json`
+- Run `Test-DASettings` to validate all required settings are configured
+- Check `Logs/` directory for detailed error information

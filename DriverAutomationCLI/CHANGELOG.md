@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.1 - 2026-03-26
+- Refactored CLI package pre-checks to use shared helpers (`Resolve-DriverPackageCheckInput`, `Test-DriverPackageExists`) to reduce naming drift and centralize package-name logic.
+- Fixed double-prompt behavior in CLI downloads by passing selected pack metadata (OS name/version and architecture) into `Get-*Drivers` so users are not asked to select the same pack twice.
+- Hardened CLI package pre-check connection handling to skip cleanly when no active SCCM CIM session exists, preventing noisy pre-check errors.
+- Updated Lenovo package version/revision source to prefer the XML `SCCM` node `date` value (compact format) instead of filename suffix parsing.
+- Added guaranteed cleanup for `DA_Stage_*` staging folders in `New-DriverPackage` using `finally`, preventing temp staging buildup in `DownloadPath`.
+
+## 2.1.0 - 2026-03-25
+- Added `Get-Packages` for listing existing driver packages in SCCM (filterable by OEM).
+- Added `Find-DriverModel` for unified model search across all OEMs.
+- Added `Update-Packages` for checking SCCM packages against catalog versions.
+- Added Browse Packages option in CLI to view deployed packages without leaving the interface.
+- Added breadcrumb trail to CLI headers showing current menu position.
+- Added status dashboard on main menu showing connection status and catalog freshness.
+- Added "Refresh Catalogs" option in Settings to force-download all OEM catalogs.
+- Improved download progress reporting to show speed (MB/s) and ETA during BITS transfers.
+- Changed catalog auto-refresh interval from 1 day to 7 days.
+- Model Lookup now offers "Search all OEMs" option using `Find-DriverModel`.
+- Updated README.md with comprehensive documentation.
+
+## 2.0.0 - 2026-03-25
+- Added `Start-DriverAutomationCLI` interactive menu-driven interface.
+- CLI offers numbered menu options: Find Model, Download Drivers, Create Custom Package, Settings, Quit.
+- OEM selection sub-menus for all supported vendors (Lenovo, Dell, HP, Microsoft, Custom).
+- `DriverAutomationCLI.ps1` rewritten as a simple wrapper that launches the interactive CLI.
+
 ## 1.6.0 - 2026-03-24
 - Added `Find-MicrosoftModel` for searching Microsoft Surface device catalog (JSON-based).
 - Added `Get-MicrosoftDrivers` for downloading and packaging Microsoft Surface driver packs.
