@@ -4810,6 +4810,39 @@ function Start-DATCLI {
         return (Read-Host "  Selection")
     }
 
+    function Resolve-OEMSelection {
+        param([string]$Selection, [object[]]$MenuItems)
+
+        if ([string]::IsNullOrWhiteSpace($Selection)) {
+            return [pscustomobject]@{ Action = "invalid"; OEM = $null }
+        }
+
+        $value = $Selection.Trim()
+        if ($value.ToUpper() -eq "B") {
+            return [pscustomobject]@{ Action = "back"; OEM = $null }
+        }
+
+        if ($value -match '^\d+$') {
+            $oemByNumber = $MenuItems | Where-Object { $_.Key -eq $value } | Select-Object -First 1
+            if ($oemByNumber) {
+                return [pscustomobject]@{ Action = "select"; OEM = $oemByNumber }
+            }
+        }
+
+        $upper = $value.ToUpper()
+        $oemByLetter = $MenuItems | Where-Object { $_.Label.Substring(0, 1).ToUpper() -eq $upper } | Select-Object -First 1
+        if ($oemByLetter) {
+            return [pscustomobject]@{ Action = "select"; OEM = $oemByLetter }
+        }
+
+        $oemByName = $MenuItems | Where-Object { $_.Label -ieq $value } | Select-Object -First 1
+        if ($oemByName) {
+            return [pscustomobject]@{ Action = "select"; OEM = $oemByName }
+        }
+
+        return [pscustomobject]@{ Action = "invalid"; OEM = $null }
+    }
+
     function Show-SubMenu {
         param([string]$Title, [string[]]$Items, [string]$Breadcrumb)
         Show-Header -Breadcrumb $Breadcrumb
@@ -5040,20 +5073,26 @@ function Start-DATCLI {
             "2" {
                 try {
                     $oemChoice = Show-OEMMenu -Action "Download Drivers" -Breadcrumb "Download Drivers"
-                    if ($oemChoice -match '^\d+$' -and [int]$oemChoice -ge 1 -and [int]$oemChoice -le 5) {
-                        $selectedOEM = $OEMMenu[[int]$oemChoice - 1]
-                        $settings = Get-DASettings
-                        if (-not $selectedOEM.FindCmd) {
-                            Write-Host ""
-                            Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
-                            Write-Host ""
-                            & $selectedOEM.GetCmd
-                            Read-Host "  Press Enter to continue"
-                        }
-                        else {
-                            $flowResult = Invoke-CLIDownloadSearchFlow -SelectedOEM $selectedOEM -Settings $settings
-                            if ($flowResult -eq "quit") { return }
-                        }
+                    $oemResult = Resolve-OEMSelection -Selection $oemChoice -MenuItems $OEMMenu
+                    if ($oemResult.Action -eq "back") { continue }
+                    if ($oemResult.Action -eq "invalid") {
+                        Write-Host "  Invalid selection. Use number, first letter, OEM name, or B." -ForegroundColor Yellow
+                        Start-Sleep -Milliseconds 700
+                        continue
+                    }
+
+                    $selectedOEM = $oemResult.OEM
+                    $settings = Get-DASettings
+                    if (-not $selectedOEM.FindCmd) {
+                        Write-Host ""
+                        Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
+                        Write-Host ""
+                        & $selectedOEM.GetCmd
+                        Read-Host "  Press Enter to continue"
+                    }
+                    else {
+                        $flowResult = Invoke-CLIDownloadSearchFlow -SelectedOEM $selectedOEM -Settings $settings
+                        if ($flowResult -eq "quit") { return }
                     }
                 }
                 catch {
