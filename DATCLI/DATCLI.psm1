@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "2.2.2"
+$ScriptRelease = "2.3.0"
 $ScriptBuildDate = "2026-03-27"
 
 # Hash Tables
@@ -378,12 +378,133 @@ function Write-LogEntry {
         switch ($Severity) {
             '1' { Write-Host $Value -ForegroundColor Cyan }
             '2' { Write-Warning $Value }
-            '3' { Write-Error $Value }
+            # Keep CLI resilient: avoid terminating behavior from Write-Error when
+            # ErrorActionPreference is Stop in wrapper scripts.
+            '3' { Write-Host $Value -ForegroundColor Red }
         }
     }
 }
 
 # // =================== SHARED PACK HELPERS ====================== //
+
+function Remove-TempPathRobust {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [int]$MaxAttempts = 3,
+        [int]$RetryDelayMs = 400,
+        [switch]$Quiet
+    )
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $true }
+
+    $previousProgressPreference = $ProgressPreference
+    try {
+        # Large recursive deletions can emit noisy progress records that "stick"
+        # at the bottom of the console in interactive sessions.
+        $ProgressPreference = 'SilentlyContinue'
+
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            try {
+                # Normalize attributes first; readonly flags are a frequent cleanup blocker.
+                if (Test-Path -LiteralPath $Path -PathType Container) {
+                    Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                        try { $_.Attributes = [System.IO.FileAttributes]::Normal } catch {}
+                    }
+                }
+                else {
+                    try { (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Attributes = [System.IO.FileAttributes]::Normal } catch {}
+                }
+
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+                return $true
+            }
+            catch {
+                if ($attempt -lt $MaxAttempts) {
+                    Start-Sleep -Milliseconds $RetryDelayMs
+                    continue
+                }
+                if (-not $Quiet) {
+                    Write-LogEntry -Value "[Warning] - Cleanup failed for ${Path}: $($_.Exception.Message)" -Severity 2
+                }
+                return $false
+            }
+        }
+    }
+    finally {
+        $ProgressPreference = $previousProgressPreference
+    }
+
+    return $false
+}
+
+function ConvertTo-SafePathSegment {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value,
+        [string]$Fallback = "Unknown"
+    )
+
+    $safe = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = $Fallback }
+
+    # Remove invalid filesystem characters for a single path segment.
+    $safe = $safe -replace '[<>:"/\\|?*]', '_'
+    # Windows folder/file names cannot end with dot or space.
+    $safe = $safe.Trim().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = $Fallback }
+
+    return $safe
+}
+
+function Invoke-StaleTempArtifactCleanup {
+    [CmdletBinding()]
+    param(
+        [int]$MinAgeHours = 8
+    )
+
+    if (-not (Test-Path -LiteralPath $global:TempDirectory)) { return }
+
+    $cutoff = (Get-Date).AddHours(-1 * [math]::Abs($MinAgeHours))
+    $catalogFiles = @(
+        $global:LenovoXMLFile,
+        $global:LenovoXMLCabFile,
+        $global:DellXMLFile,
+        $global:DellXMLCabFile,
+        $global:HPXMLFile,
+        $global:HPXMLCabFile,
+        $global:MicrosoftXMLFile,
+        $global:MicrosoftJSONFile
+    ) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
+
+    # Sweep stale staging and extracted driver folders created by DATCLI.
+    $staleDirs = Get-ChildItem -LiteralPath $global:TempDirectory -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+        $_.LastWriteTime -lt $cutoff -and (
+            $_.Name -like "DA_Stage_*" -or
+            $_.Name -like "*_Drivers_*"
+        )
+    }
+    foreach ($dir in $staleDirs) {
+        if (Remove-TempPathRobust -Path $dir.FullName -Quiet) {
+            Write-LogEntry -Value "- Cleanup: Removed stale temp directory $($dir.FullName)" -Severity 1
+        }
+    }
+
+    # Sweep stale package download files while preserving OEM catalog cache files.
+    $staleFiles = Get-ChildItem -LiteralPath $global:TempDirectory -File -Force -ErrorAction SilentlyContinue | Where-Object {
+        $_.LastWriteTime -lt $cutoff -and
+        $_.Extension -in @(".msi", ".exe", ".cab", ".zip", ".wim") -and
+        ($catalogFiles -notcontains $_.Name.ToLowerInvariant())
+    }
+    foreach ($file in $staleFiles) {
+        if (Remove-TempPathRobust -Path $file.FullName -Quiet) {
+            Write-LogEntry -Value "- Cleanup: Removed stale temp file $($file.FullName)" -Severity 1
+        }
+    }
+}
 
 function Publish-DriverPackage {
     param (
@@ -460,7 +581,7 @@ function Publish-DriverPackage {
     
     $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
     if (Test-Path -Path $ExtractDest) {
-        try { Remove-Item -Path $ExtractDest -Recurse -Force -ErrorAction Stop } catch {}
+        Remove-TempPathRobust -Path $ExtractDest -Quiet | Out-Null
     }
 
     if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make $OEM)) { return $false }
@@ -523,8 +644,13 @@ function Publish-DriverPackage {
             # at the bottom of the console after large folder cleanup operations.
             $ProgressPreference = 'SilentlyContinue'
             foreach ($p in @($TempDest, $ExtractDest)) {
-                if ($p -and (Test-Path -Path $p)) { Remove-Item -Path $p -Recurse -Force -ErrorAction Stop }
+                if ($p -and (Test-Path -Path $p)) {
+                    if (Remove-TempPathRobust -Path $p -Quiet) {
+                        Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
+                    }
+                }
             }
+            Invoke-StaleTempArtifactCleanup -MinAgeHours 8
             Write-Progress -Activity "Cleanup" -Completed
         }
         catch {}
@@ -1033,12 +1159,19 @@ $global:HPSoftPaqList = $null
 $global:SCCMNamespace = $null
 
 # Microsoft Variables
+$MicrosoftXMLSource = ($global:OEMLinks.OEM.Manufacturer | Where-Object {
+        $_.Name -match "Microsoft"
+    }).Link | Where-Object {
+    $_.Type -eq "XMLSource"
+} | Select-Object -ExpandProperty URL
+
 $MicrosoftJSONSource = ($global:OEMLinks.OEM.Manufacturer | Where-Object {
         $_.Name -match "Microsoft"
     }).Link | Where-Object {
     $_.Type -eq "JSONSource"
 } | Select-Object -ExpandProperty URL
 
+$global:MicrosoftXMLFile = if ($MicrosoftXMLSource) { "build-driverpack.xml" } else { "" }
 $global:MicrosoftJSONFile = if ($MicrosoftJSONSource) { "build-driverpack.json" } else { "" }
 $global:MicrosoftModelDrivers = $null
 
@@ -2984,7 +3117,7 @@ function New-DriverPackage {
     finally {
         if ($StagingRoot -and (Test-Path -Path $StagingRoot)) {
             try {
-                Remove-Item -Path $StagingRoot -Recurse -Force -ErrorAction Stop
+                Remove-TempPathRobust -Path $StagingRoot -Quiet | Out-Null
                 Write-LogEntry -Value "- DriverPackage: Removed staging folder $StagingRoot" -Severity 1
             }
             catch {
@@ -3296,7 +3429,7 @@ function Get-LenovoDrivers {
 
     $FolderOs = ($SelectedPackOsName -replace 'Windows\s+', 'Windows')
     $FolderOs = ($FolderOs -replace '\s+', '')
-    $FolderModel = $Model
+    $FolderModel = ConvertTo-SafePathSegment -Value $Model -Fallback "LenovoModel"
     $FolderArch = if ($SelectedPackArch) { $SelectedPackArch } else { $Architecture }
     if ($OSVersion) {
         $FolderName = "$FolderOs-$OSVersion-$FolderArch-$($DownloadInfo.Revision)"
@@ -3304,6 +3437,7 @@ function Get-LenovoDrivers {
     else {
         $FolderName = "$FolderOs-$FolderArch-$($DownloadInfo.Revision)"
     }
+    $FolderName = ConvertTo-SafePathSegment -Value $FolderName -Fallback "DriverPack"
     
     $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Lenovo") $FolderModel) $FolderName
 
@@ -3625,7 +3759,9 @@ function Get-DellDrivers {
     $FolderOs = ($FolderOs -replace '\s+', '')
     $FolderName = "$FolderOs-$($DownloadInfo.Revision)"
     
-    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Dell") $DisplayModel) $FolderName
+    $FolderModelPath = ConvertTo-SafePathSegment -Value $DisplayModel -Fallback "DellModel"
+    $FolderName = ConvertTo-SafePathSegment -Value $FolderName -Fallback "DriverPack"
+    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Dell") $FolderModelPath) $FolderName
 
     # SCCM package name (Dell may intentionally omit OS version)
     $OSDisplay = ($SelectedPackOsName -replace "Windows(\d+)", "Windows $1").Trim()
@@ -4019,7 +4155,9 @@ function Get-HPDrivers {
     else {
         $FolderName = "$FolderOs-$SelectedPackArch-$($DownloadInfo.Revision)"
     }
-    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "HP") $DisplayModel) $FolderName
+    $FolderModelPath = ConvertTo-SafePathSegment -Value $DisplayModel -Fallback "HPModel"
+    $FolderName = ConvertTo-SafePathSegment -Value $FolderName -Fallback "DriverPack"
+    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "HP") $FolderModelPath) $FolderName
 
     # SCCM package name — "Drivers - HP <model> - Windows 10 22H2 x64"
     $OSDisplay = $SelectedPackOsName   # Already "Windows 10" / "Windows 11"
@@ -4062,80 +4200,258 @@ function Find-MicrosoftModel {
         }
     }
 
-    if (-not $MicrosoftJSONSource) {
-        Write-LogEntry -Value "[Error] - Microsoft JSON source not found in OEMLinks.xml." -Severity 3
+    if (-not $MicrosoftJSONSource -and -not $MicrosoftXMLSource) {
+        Write-LogEntry -Value "[Error] - Microsoft JSON/XML sources not found in OEMLinks.xml." -Severity 3
         return $null
     }
 
-    $microsoftJsonPath = Join-Path $global:TempDirectory -ChildPath $global:MicrosoftJSONFile
-
-    $refreshNeeded = $false
-    if (Test-Path -Path $microsoftJsonPath) {
-        try {
-            $AgeDays = (New-TimeSpan -Start (Get-Item $microsoftJsonPath).LastWriteTime -End (Get-Date)).TotalDays
-            if ($AgeDays -ge 7) { $refreshNeeded = $true }
-        }
-        catch {
-            $refreshNeeded = $true
-        }
+    function Resolve-RawUrl {
+        param([string]$Url)
+        if (-not $Url) { return $null }
+        return ($Url -replace "github.com/([^/]+)/([^/]+)/blob/", "raw.githubusercontent.com/`$1/`$2/")
     }
 
-    if (-not (Test-Path -Path $microsoftJsonPath) -or $refreshNeeded) {
-        if ($refreshNeeded) {
-            $global:MicrosoftModelDrivers = $null
-        }
-        Write-LogEntry -Value "======== Downloading Microsoft Surface Driver Catalog ========" -Severity 1
+    function Download-MicrosoftCatalogFile {
+        param([string]$SourceUrl, [string]$DestinationPath, [string]$Label)
+        if (-not $SourceUrl -or -not $DestinationPath) { return $false }
         try {
-            # GitHub raw URLs need to use raw.githubusercontent.com
-            $downloadUrl = $MicrosoftJSONSource -replace "github.com/([^/]+)/([^/]+)/blob/", "raw.githubusercontent.com/`$1/`$2/"
+            $downloadUrl = Resolve-RawUrl -Url $SourceUrl
             if ($global:ProxySettingsSet) {
-                Start-BitsTransfer -Source $downloadUrl -Destination $microsoftJsonPath @global:BitsProxyOptions
+                Start-BitsTransfer -Source $downloadUrl -Destination $DestinationPath @global:BitsProxyOptions
             }
             else {
-                Start-BitsTransfer -Source $downloadUrl -Destination $microsoftJsonPath @global:BitsOptions
+                Start-BitsTransfer -Source $downloadUrl -Destination $DestinationPath @global:BitsOptions
             }
-            if (Test-Path -Path $microsoftJsonPath) {
-                try { (Get-Item -Path $microsoftJsonPath).LastWriteTime = Get-Date } catch { }
+            if (Test-Path -Path $DestinationPath) {
+                try { (Get-Item -Path $DestinationPath).LastWriteTime = Get-Date } catch {}
+                return $true
             }
         }
         catch {
-            Write-LogEntry -Value "[Error] - Failed to download Microsoft JSON: $($_.Exception.Message)" -Severity 3
-            return $null
+            Write-LogEntry -Value "[Warning] - Failed to download Microsoft $Label catalog: $($_.Exception.Message)" -Severity 2
         }
+        return $false
     }
 
-    if (Test-Path -Path $microsoftJsonPath) {
-        if ($null -eq $global:MicrosoftModelDrivers) {
-            Write-LogEntry -Value "- Reading Microsoft driver pack JSON file" -Severity 1
-            $global:MicrosoftModelDrivers = Get-Content -Path $microsoftJsonPath -Raw | ConvertFrom-Json
-        }
+    function Get-XmlNodeFieldValue {
+        param([System.Xml.XmlNode]$Node, [string[]]$FieldNames)
+        if (-not $Node -or -not $FieldNames) { return $null }
+        foreach ($field in $FieldNames) {
+            $child = $Node.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element -and $_.Name -ieq $field } | Select-Object -First 1
+            if ($child -and $child.InnerText) { return $child.InnerText.Trim() }
+            $attr = $Node.Attributes | Where-Object { $_.Name -ieq $field } | Select-Object -First 1
+            if ($attr -and $attr.Value) { return $attr.Value.Trim() }
 
-        $modelPattern = if ($Model -match "[\\*\\?]") { $Model } else { "*$Model*" }
-        $Results = foreach ($pack in $global:MicrosoftModelDrivers) {
-            if (($pack.Model -like $modelPattern) -or ($pack.Product -like $modelPattern)) {
-                [pscustomobject]@{
-                    Name           = $pack.Model
-                    SKU            = $pack.Product
-                    OS             = $pack.OSVersion
-                    OSReleaseId    = $pack.OSReleaseId
-                    OSArchitecture = $pack.OSArchitecture
-                    FileName       = $pack.FileName
+            # PowerShell CliXML layout stores properties as elements with a name attribute:
+            # <S N="Model">...</S>, <S N="Product">...</S>, etc.
+            $named = $Node.ChildNodes | Where-Object {
+                $_.NodeType -eq [System.Xml.XmlNodeType]::Element -and
+                $_.Attributes -and
+                ($_.Attributes | Where-Object { $_.Name -ieq "N" -and $_.Value -ieq $field })
+            } | Select-Object -First 1
+            if ($named -and $named.InnerText) { return $named.InnerText.Trim() }
+
+            # Nested fallback for CliXML <Obj><MS>... pattern (namespace-safe by checking attributes directly).
+            $descendants = $Node.SelectNodes(".//*")
+            if ($descendants) {
+                foreach ($d in $descendants) {
+                    if (-not $d.Attributes) { continue }
+                    $nAttr = $d.Attributes | Where-Object { $_.Name -ieq "N" } | Select-Object -First 1
+                    if ($nAttr -and $nAttr.Value -ieq $field -and $d.InnerText) {
+                        return $d.InnerText.Trim()
+                    }
                 }
             }
         }
-        $Results = $Results | Sort-Object -Property Name, SKU, OS -Unique
+        return $null
+    }
 
-        if ($Results -and $Results.Count -gt 0) {
-            Write-LogEntry -Value "- Found $($Results.Count) matching model(s)" -Severity 1
-            return $Results
+    function Convert-MicrosoftXmlToCatalogRows {
+        param([xml]$XmlData)
+        if (-not $XmlData) { return @() }
+
+        # Support both OEM-style XML and PowerShell CliXML exports.
+        $nodes = @($XmlData.SelectNodes("//*[local-name()='DriverPack' or local-name()='Item' or local-name()='Package' or local-name()='Driver' or local-name()='Obj']"))
+        if (-not $nodes -or $nodes.Count -eq 0) {
+            $nodes = @($XmlData.DocumentElement.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })
         }
-        else {
-            if (-not [string]::IsNullOrWhiteSpace($Model) -and ($Model -notmatch '^[\\*\\?]+$')) {
-                Write-LogEntry -Value "[Warning] - No models found matching '$Model'" -Severity 2
+
+        $rows = foreach ($n in $nodes) {
+            $model = Get-XmlNodeFieldValue -Node $n -FieldNames @("Model", "SystemName")
+            $product = Get-XmlNodeFieldValue -Node $n -FieldNames @("Product", "SKU", "SystemSKU")
+            $osVersion = Get-XmlNodeFieldValue -Node $n -FieldNames @("OSVersion", "OS")
+            $osReleaseId = Get-XmlNodeFieldValue -Node $n -FieldNames @("OSReleaseId", "ReleaseId")
+            $osArch = Get-XmlNodeFieldValue -Node $n -FieldNames @("OSArchitecture", "Architecture")
+            $fileName = Get-XmlNodeFieldValue -Node $n -FieldNames @("FileName", "Filename")
+            $url = Get-XmlNodeFieldValue -Node $n -FieldNames @("Url", "URL", "DownloadUrl")
+            $catalogVersion = Get-XmlNodeFieldValue -Node $n -FieldNames @("CatalogVersion", "Version")
+            $name = Get-XmlNodeFieldValue -Node $n -FieldNames @("Name", "Title")
+
+            if (-not $model -or -not ($product -or $fileName -or $url)) { continue }
+            if (-not $product) { $product = $model }
+            if (-not $name) { $name = $model }
+
+            [pscustomobject]@{
+                CatalogVersion = $catalogVersion
+                Model          = $model
+                Product        = $product
+                Name           = $name
+                FileName       = $fileName
+                Url            = $url
+                OSVersion      = $osVersion
+                OSReleaseId    = $osReleaseId
+                OSArchitecture = $osArch
             }
-            return $null
+        }
+        return @($rows)
+    }
+
+    function Get-MicrosoftPackKey {
+        param([psobject]$Pack)
+        $model = [string]$Pack.Model
+        $product = [string]$Pack.Product
+        $os = [string]$Pack.OSVersion
+        $release = [string]$Pack.OSReleaseId
+        $arch = [string]$Pack.OSArchitecture
+        $file = [string]$Pack.FileName
+        $url = [string]$Pack.Url
+        return ($model, $product, $os, $release, $arch, $file, $url) -join "|"
+    }
+
+    function Normalize-MicrosoftSearchText {
+        param([string]$Text)
+        if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+        $normalized = $Text.ToLowerInvariant()
+        $normalized = $normalized -replace '[_\-]+', ' '
+        $normalized = $normalized -replace '\b(\d+)(st|nd|rd|th)\b', '$1'
+        $normalized = $normalized -replace '[^a-z0-9\s]', ' '
+        $normalized = ($normalized -replace '\s+', ' ').Trim()
+        return $normalized
+    }
+
+    function Test-MicrosoftSearchMatch {
+        param(
+            [psobject]$Pack,
+            [string]$Search,
+            [bool]$HasWildcard
+        )
+
+        $candidates = @(
+            [string]$Pack.Model,
+            [string]$Pack.Product,
+            [string]$Pack.Name
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        if ($HasWildcard) {
+            foreach ($c in $candidates) {
+                if ($c -like $Search) { return $true }
+            }
+            return $false
+        }
+
+        $searchNorm = Normalize-MicrosoftSearchText -Text $Search
+        if (-not $searchNorm) { return $false }
+
+        foreach ($c in $candidates) {
+            $candidateNorm = Normalize-MicrosoftSearchText -Text $c
+            if ($candidateNorm -like "*$searchNorm*") { return $true }
+        }
+        return $false
+    }
+
+    $microsoftJsonPath = if ($global:MicrosoftJSONFile) { Join-Path $global:TempDirectory -ChildPath $global:MicrosoftJSONFile } else { $null }
+    $microsoftXmlPath = if ($global:MicrosoftXMLFile) { Join-Path $global:TempDirectory -ChildPath $global:MicrosoftXMLFile } else { $null }
+
+    $refreshNeeded = $false
+    foreach ($p in @($microsoftJsonPath, $microsoftXmlPath)) {
+        if (-not $p) { continue }
+        if (Test-Path -Path $p) {
+            try {
+                $AgeDays = (New-TimeSpan -Start (Get-Item $p).LastWriteTime -End (Get-Date)).TotalDays
+                if ($AgeDays -ge 7) { $refreshNeeded = $true }
+            }
+            catch {
+                $refreshNeeded = $true
+            }
         }
     }
+    if ($refreshNeeded) { $global:MicrosoftModelDrivers = $null }
+
+    if ($microsoftJsonPath -and ((-not (Test-Path -Path $microsoftJsonPath)) -or $refreshNeeded)) {
+        Write-LogEntry -Value "======== Downloading Microsoft JSON catalog ========" -Severity 1
+        Download-MicrosoftCatalogFile -SourceUrl $MicrosoftJSONSource -DestinationPath $microsoftJsonPath -Label "JSON" | Out-Null
+    }
+    if ($microsoftXmlPath -and ((-not (Test-Path -Path $microsoftXmlPath)) -or $refreshNeeded)) {
+        Write-LogEntry -Value "======== Downloading Microsoft XML catalog ========" -Severity 1
+        Download-MicrosoftCatalogFile -SourceUrl $MicrosoftXMLSource -DestinationPath $microsoftXmlPath -Label "XML" | Out-Null
+    }
+
+    if ($null -eq $global:MicrosoftModelDrivers) {
+        $jsonRows = @()
+        if ($microsoftJsonPath -and (Test-Path -Path $microsoftJsonPath)) {
+            Write-LogEntry -Value "- Reading Microsoft driver pack JSON file" -Severity 1
+            try { $jsonRows = @(Get-Content -Path $microsoftJsonPath -Raw | ConvertFrom-Json) } catch { $jsonRows = @() }
+        }
+
+        $xmlRows = @()
+        if ($microsoftXmlPath -and (Test-Path -Path $microsoftXmlPath)) {
+            Write-LogEntry -Value "- Reading Microsoft driver pack XML file" -Severity 1
+            try {
+                [xml]$xmlData = Get-Content -Path $microsoftXmlPath -Raw
+                $xmlRows = Convert-MicrosoftXmlToCatalogRows -XmlData $xmlData
+            }
+            catch {
+                Write-LogEntry -Value "[Warning] - Failed to parse Microsoft XML catalog: $($_.Exception.Message)" -Severity 2
+                $xmlRows = @()
+            }
+        }
+
+        $combined = @()
+        $seen = @{}
+        foreach ($p in $jsonRows) {
+            $key = Get-MicrosoftPackKey -Pack $p
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $combined += $p
+            }
+        }
+        foreach ($p in $xmlRows) {
+            $key = Get-MicrosoftPackKey -Pack $p
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $combined += $p
+            }
+        }
+
+        $global:MicrosoftModelDrivers = $combined
+        Write-LogEntry -Value "- Microsoft merged catalog entries loaded: JSON=$($jsonRows.Count) XML=$($xmlRows.Count) Combined=$($combined.Count)" -Severity 1
+    }
+
+    $hasWildcard = ($Model -match "[\\*\\?]")
+    $modelPattern = if ($hasWildcard) { $Model } else { "*$Model*" }
+    $Results = foreach ($pack in $global:MicrosoftModelDrivers) {
+        if (Test-MicrosoftSearchMatch -Pack $pack -Search $modelPattern -HasWildcard $hasWildcard) {
+            [pscustomobject]@{
+                Name           = $pack.Model
+                SKU            = $pack.Product
+                OS             = $pack.OSVersion
+                OSReleaseId    = $pack.OSReleaseId
+                OSArchitecture = $pack.OSArchitecture
+                FileName       = $pack.FileName
+            }
+        }
+    }
+    $Results = $Results | Sort-Object -Property Name, SKU, OS, OSReleaseId, FileName -Unique
+
+    if ($Results -and $Results.Count -gt 0) {
+        Write-LogEntry -Value "- Found $($Results.Count) matching model(s)" -Severity 1
+        return $Results
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Model) -and ($Model -notmatch '^[\\*\\?]+$')) {
+        Write-LogEntry -Value "[Warning] - No models found matching '$Model'" -Severity 2
+    }
+    return $null
 }
 
 function Get-MicrosoftDrivers {
@@ -4268,13 +4584,14 @@ function Get-MicrosoftDrivers {
     # 8. Build folder structure - use Product (SKU) for unique folder naming per Microsoft convention
     $FolderOs = ($SelectedOSName -replace 'Windows\s+', 'Windows')
     $FolderOs = ($FolderOs -replace '\s+', '')
-    $FolderModel = $SelectedPack.Product
+    $FolderModel = ConvertTo-SafePathSegment -Value $SelectedPack.Product -Fallback "MicrosoftModel"
     if ($SelectedOSVersion) {
         $FolderName = "$FolderOs-$SelectedOSVersion-$SelectedArchitecture-$SelectedRevision"
     }
     else {
         $FolderName = "$FolderOs-$SelectedArchitecture-$SelectedRevision"
     }
+    $FolderName = ConvertTo-SafePathSegment -Value $FolderName -Fallback "DriverPack"
 
     $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Microsoft") $FolderModel) $FolderName
 
@@ -4413,15 +4730,17 @@ function Get-CustomDrivers {
     # 4. Build folder structure
     $FolderOs = ($OSName -replace 'Windows\s+', 'Windows')
     $FolderOs = ($FolderOs -replace '\s+', '')
-    $FolderModel = ($Model -replace '[<>:"/\\|?*]', '').Trim()
+    $FolderManufacturer = ConvertTo-SafePathSegment -Value $Manufacturer -Fallback "Custom"
+    $FolderModel = ConvertTo-SafePathSegment -Value $Model -Fallback "CustomModel"
     if ($OSVersion) {
         $FolderName = "$FolderOs-$OSVersion-$Architecture"
     }
     else {
         $FolderName = "$FolderOs-$Architecture"
     }
+    $FolderName = ConvertTo-SafePathSegment -Value $FolderName -Fallback "DriverPack"
 
-    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath $Manufacturer) $FolderModel) $FolderName
+    $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath $FolderManufacturer) $FolderModel) $FolderName
 
     # 5. Build SCCM package name
     $OSDisplay = ($OSName -replace "Windows(\d+)", "Windows $1").Trim()
@@ -4859,7 +5178,24 @@ function Start-DATCLI {
         param([psobject]$Pack)
         $parts = @($Pack.Name)
         if ($Pack.SKU) { $parts += "| $($Pack.SKU)" }
-        if ($Pack.OS) { $parts += "| $($Pack.OS)" }
+        if ($Pack.OS) {
+            $osDisplay = [string]$Pack.OS
+            $releaseId = ""
+            if ($Pack.PSObject.Properties.Name -contains "OSReleaseId") {
+                $releaseId = [string]$Pack.OSReleaseId
+            }
+
+            if ($releaseId -and $osDisplay -notmatch [regex]::Escape($releaseId)) {
+                if ($osDisplay -match '^(Windows\s+\d+)(.*)$') {
+                    $osDisplay = "$($Matches[1]) $releaseId$($Matches[2])"
+                }
+                else {
+                    $osDisplay = "$osDisplay $releaseId"
+                }
+            }
+
+            $parts += "| $osDisplay"
+        }
         if ($Pack.FileName) { $parts += "| $($Pack.FileName)" }
         return ($parts -join ' ')
     }
@@ -4874,9 +5210,10 @@ function Start-DATCLI {
     function Select-PackFromResults {
         param([object[]]$Results)
         while ($true) {
+            Write-Host "    Tip: Select multiple packs with commas (e.g. 1,3,5)" -ForegroundColor DarkGray
             Write-Host "    [S] Search again"
             Write-Host "    [B] Back"
-            $selection = Read-Host "  Select pack number"
+            $selection = Read-Host "  Select pack number (or comma-separated numbers)"
             switch ($selection.ToUpper()) {
                 "B" { return [pscustomobject]@{ Action = "back"; Pack = $null } }
                 "S" { return [pscustomobject]@{ Action = "search"; Pack = $null } }
@@ -4884,37 +5221,62 @@ function Start-DATCLI {
                     if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $Results.Count) {
                         return [pscustomobject]@{ Action = "select"; Pack = $Results[[int]$selection - 1] }
                     }
-                    Write-Host "  Invalid selection. Enter a pack number, S, or B." -ForegroundColor Yellow
+
+                    # Bulk selection: e.g. "1,3,7"
+                    if ($selection -match '^\s*\d+(\s*,\s*\d+)+\s*$') {
+                        $indices = $selection.Split(',') |
+                            ForEach-Object { $_.Trim() } |
+                            Where-Object { $_ -match '^\d+$' } |
+                            ForEach-Object { [int]$_ - 1 }
+
+                        if ($indices.Count -gt 0 -and ($indices | Where-Object { $_ -lt 0 -or $_ -ge $Results.Count }).Count -eq 0) {
+                            $uniqueIndices = $indices | Select-Object -Unique
+                            $packs = foreach ($idx in $uniqueIndices) { $Results[$idx] }
+                            return [pscustomobject]@{ Action = "selectMany"; Packs = @($packs) }
+                        }
+                    }
+
+                    Write-Host "  Invalid selection. Enter a pack number, comma-separated numbers, S, or B." -ForegroundColor Yellow
                 }
             }
         }
     }
 
     function Invoke-CLIPackagePrecheck {
-        param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$Settings)
+        param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$Settings, [switch]$Silent)
         $packInput = if ($SelectedOEM.FindCmd) { Resolve-DriverPackageCheckInput -OEM $SelectedOEM.Label -SelectedModel $SelectedModel } else { $null }
         $hasExistingPackage = $false
 
         if ($Settings.SiteServer -and $SelectedOEM.FindCmd) {
-            Write-Host ""
-            Write-Host "  Checking for existing SCCM package..." -ForegroundColor Yellow
+            if (-not $Silent) {
+                Write-Host ""
+                Write-Host "  Checking for existing SCCM package..." -ForegroundColor Yellow
+            }
             $pkgCheck = Test-DriverPackageExists -SiteServer $Settings.SiteServer -OEM $SelectedOEM.Label -SelectedModel $SelectedModel -TimeoutSec 10
             if ($pkgCheck.CanCheck) {
-                Write-Host "  Checking for package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
+                if (-not $Silent) {
+                    Write-Host "  Checking for package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
+                }
                 if ($pkgCheck.ExistingPackage) {
                     $hasExistingPackage = $true
-                    Write-Host "  Found existing SCCM package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
-                    Write-Host "  Package ID: $($pkgCheck.ExistingPackage.PackageID), Version: $($pkgCheck.ExistingPackage.Version)" -ForegroundColor Yellow
+                    if (-not $Silent) {
+                        Write-Host "  Found existing SCCM package: $($pkgCheck.PackageName)" -ForegroundColor Yellow
+                        Write-Host "  Package ID: $($pkgCheck.ExistingPackage.PackageID), Version: $($pkgCheck.ExistingPackage.Version)" -ForegroundColor Yellow
+                    }
                 }
                 elseif ($pkgCheck.NewerPackage) {
                     $hasExistingPackage = $true
-                    Write-Host "  Found newer package in SCCM for this model/OS family/arch: $($pkgCheck.NewerPackage.Name)" -ForegroundColor Yellow
-                    Write-Host "  Package ID: $($pkgCheck.NewerPackage.PackageID), Version: $($pkgCheck.NewerPackage.Version)" -ForegroundColor Yellow
-                    Write-Host "  Selected pack is older than existing content. Use Force to replace it." -ForegroundColor Yellow
+                    if (-not $Silent) {
+                        Write-Host "  Found newer package in SCCM for this model/OS family/arch: $($pkgCheck.NewerPackage.Name)" -ForegroundColor Yellow
+                        Write-Host "  Package ID: $($pkgCheck.NewerPackage.PackageID), Version: $($pkgCheck.NewerPackage.Version)" -ForegroundColor Yellow
+                        Write-Host "  Selected pack is older than existing content. Use Force to replace it." -ForegroundColor Yellow
+                    }
                 }
             }
             elseif ($pkgCheck.Reason) {
-                Write-Host "  Package pre-check skipped: $($pkgCheck.Reason)" -ForegroundColor DarkYellow
+                if (-not $Silent) {
+                    Write-Host "  Package pre-check skipped: $($pkgCheck.Reason)" -ForegroundColor DarkYellow
+                }
             }
         }
 
@@ -4930,10 +5292,10 @@ function Start-DATCLI {
             Write-Host ""
             Write-Host "  Selected: $(Format-PackDisplay -Pack $SelectedModel)" -ForegroundColor Green
             if ($HasExistingPackage) {
-                Write-Host "    [F] Force update" -ForegroundColor Cyan
+                Write-Host "    [F] Force update now" -ForegroundColor Cyan
             }
             else {
-                Write-Host "    [D] Download" -ForegroundColor Cyan
+                Write-Host "    [D] Download now" -ForegroundColor Cyan
             }
             Write-Host "    [S] Search again"
             Write-Host "    [B] Back"
@@ -4958,12 +5320,8 @@ function Start-DATCLI {
         }
     }
 
-    function Invoke-CLISelectedDownload {
+    function New-CLIInvokeParams {
         param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$PackInput, [bool]$ForcePrompt)
-        Write-Host ""
-        Write-Host "  Starting $($SelectedOEM.Label) driver workflow..." -ForegroundColor Green
-        Write-Host ""
-
         if ($SelectedOEM.Label -eq "Microsoft" -and $SelectedModel.SKU) {
             $invokeParams = @{
                 Model   = $SelectedModel.Name
@@ -4974,20 +5332,33 @@ function Start-DATCLI {
                 if ($PackInput.OSVersion) { $invokeParams.OSVersion = $PackInput.OSVersion }
             }
             if ($ForcePrompt) { $invokeParams.Force = $true }
-            & $SelectedOEM.GetCmd @invokeParams
-        }
-        else {
-            $invokeParams = @{ Model = $SelectedModel.Name }
-            if ($PackInput) {
-                if ($PackInput.OSName) { $invokeParams.OSName = $PackInput.OSName }
-                if ($PackInput.OSVersion) { $invokeParams.OSVersion = $PackInput.OSVersion }
-                if ($PackInput.Architecture) { $invokeParams.Architecture = $PackInput.Architecture }
-            }
-            if ($ForcePrompt) { $invokeParams.Force = $true }
-            & $SelectedOEM.GetCmd @invokeParams
+            return $invokeParams
         }
 
-        Read-Host "  Press Enter to continue"
+        $invokeParams = @{ Model = $SelectedModel.Name }
+        if ($PackInput) {
+            if ($PackInput.OSName) { $invokeParams.OSName = $PackInput.OSName }
+            if ($PackInput.OSVersion) { $invokeParams.OSVersion = $PackInput.OSVersion }
+            if ($PackInput.Architecture) { $invokeParams.Architecture = $PackInput.Architecture }
+        }
+        if ($ForcePrompt) { $invokeParams.Force = $true }
+        return $invokeParams
+    }
+
+    function Invoke-CLISelectedDownload {
+        param([hashtable]$SelectedOEM, [psobject]$SelectedModel, [psobject]$PackInput, [bool]$ForcePrompt, [switch]$NoPause)
+        Write-Host ""
+        Write-Host "  Starting $($SelectedOEM.Label) driver workflow..." -ForegroundColor Green
+        Write-Host ""
+
+        $cliDisplay = Format-PackDisplay -Pack $SelectedModel
+        Write-LogEntry -Value "[CLI] Starting $($SelectedOEM.Label) workflow for selected pack: $cliDisplay | Force: $ForcePrompt" -Severity 1
+        $invokeParams = New-CLIInvokeParams -SelectedOEM $SelectedOEM -SelectedModel $SelectedModel -PackInput $PackInput -ForcePrompt $ForcePrompt
+        & $SelectedOEM.GetCmd @invokeParams
+
+        if (-not $NoPause) {
+            Read-Host "  Press Enter to continue"
+        }
     }
 
     function Invoke-CLIDownloadSearchFlow {
@@ -5020,14 +5391,67 @@ function Start-DATCLI {
 
             $selected = Select-PackFromResults -Results $results
             if ($selected.Action -eq "search" -or $selected.Action -eq "back") { continue }
+
+            if ($selected.Action -eq "selectMany" -and $selected.Packs) {
+                Write-LogEntry -Value "[CLI] Bulk selection detected for $($SelectedOEM.Label): $($selected.Packs.Count) pack(s) selected." -Severity 1
+                $prechecks = foreach ($pack in $selected.Packs) {
+                    $pc = Invoke-CLIPackagePrecheck -SelectedOEM $SelectedOEM -SelectedModel $pack -Settings $Settings -Silent
+                    [pscustomobject]@{
+                        Pack     = $pack
+                        PackInput = $pc.PackInput
+                        HasExisting = $pc.HasExistingPackage
+                    }
+                }
+
+                $existingCount = @($prechecks | Where-Object { $_.HasExisting }).Count
+                $forceExisting = $false
+                if ($existingCount -gt 0) {
+                    Write-Host ""
+                    Write-Host "  $existingCount selected pack(s) already exist/newer in SCCM." -ForegroundColor Yellow
+                    $forceChoice = Read-Host "  Run those existing items with Force update? (Y/N) [N]"
+                    if ($forceChoice -and $forceChoice.ToUpper() -eq "Y") { $forceExisting = $true }
+                }
+                Write-LogEntry -Value "[CLI] Bulk run force decision for existing items: ForceExisting=$forceExisting (ExistingCount=$existingCount)." -Severity 1
+
+                $runCount = 0
+                $failCount = 0
+                foreach ($item in $prechecks) {
+                    $runForce = ($forceExisting -and $item.HasExisting)
+                    Write-Host ""
+                    $progressLabel = "[$($runCount + 1)/$($prechecks.Count)] Running: $(Format-PackDisplay -Pack $item.Pack)"
+                    Write-Host "  $progressLabel" -ForegroundColor Cyan
+                    Write-LogEntry -Value "[CLI Bulk $($runCount + 1)/$($prechecks.Count)] $($SelectedOEM.Label): $(Format-PackDisplay -Pack $item.Pack) | Force: $runForce" -Severity 1
+                    try {
+                        Invoke-CLISelectedDownload -SelectedOEM $SelectedOEM -SelectedModel $item.Pack -PackInput $item.PackInput -ForcePrompt $runForce -NoPause
+                    }
+                    catch {
+                        $failCount++
+                        Write-LogEntry -Value "[CLI Bulk $($runCount + 1)/$($prechecks.Count)] Failed: $($_.Exception.Message)" -Severity 3
+                        Write-Host "  [Error] - Bulk item failed: $($_.Exception.Message)" -ForegroundColor Red
+                    }
+                    $runCount++
+                }
+
+                Write-Host ""
+                Write-Host "  Bulk run complete. Processed: $runCount  Failed: $failCount" -ForegroundColor Green
+                Write-LogEntry -Value "[CLI] Bulk run complete for $($SelectedOEM.Label). Processed=$runCount Failed=$failCount." -Severity 1
+                Read-Host "  Press Enter to continue"
+                continue
+            }
+
             if (-not $selected.Pack) { continue }
 
             $precheck = Invoke-CLIPackagePrecheck -SelectedOEM $SelectedOEM -SelectedModel $selected.Pack -Settings $Settings
             $actionResult = Select-PackAction -SelectedModel $selected.Pack -HasExistingPackage $precheck.HasExistingPackage
-            if ($actionResult.Action -eq "search" -or $actionResult.Action -eq "back") { continue }
-
-            Invoke-CLISelectedDownload -SelectedOEM $SelectedOEM -SelectedModel $selected.Pack -PackInput $precheck.PackInput -ForcePrompt $actionResult.Force
-            return "done"
+            switch ($actionResult.Action) {
+                "search" { continue }
+                "back" { continue }
+                "start" {
+                    Invoke-CLISelectedDownload -SelectedOEM $SelectedOEM -SelectedModel $selected.Pack -PackInput $precheck.PackInput -ForcePrompt $actionResult.Force
+                    return "done"
+                }
+                default { continue }
+            }
         }
     }
 
@@ -5048,16 +5472,16 @@ function Start-DATCLI {
 
         switch ($mainChoice.ToUpper()) {
             "1" {
-                $lookupChoice = Show-SubMenu -Title "Model Lookup" -Items @("Search all OEMs", "Lenovo", "Dell", "HP", "Microsoft") -Breadcrumb "Model Lookup"
+                $lookupChoice = Show-SubMenu -Title "Model Lookup" -Items @("Dell", "HP", "Lenovo", "Microsoft", "Search all OEMs") -Breadcrumb "Model Lookup"
                 if ($lookupChoice -match '^[1-5]$') {
                     $searchModel = Read-Host "  Enter model search term"
                     if ($searchModel) {
                         Write-Host ""
-                        if ($lookupChoice -eq "1") {
+                        if ($lookupChoice -eq "5") {
                             $results = Find-DriverModel -Model $searchModel
                         }
                         else {
-                            $oemMap = @{ "2" = "Find-LenovoModel"; "3" = "Find-DellModel"; "4" = "Find-HPModel"; "5" = "Find-MicrosoftModel" }
+                            $oemMap = @{ "1" = "Find-DellModel"; "2" = "Find-HPModel"; "3" = "Find-LenovoModel"; "4" = "Find-MicrosoftModel" }
                             $results = & $oemMap[$lookupChoice] -Model $searchModel
                         }
                         if ($results) {
@@ -5071,35 +5495,43 @@ function Start-DATCLI {
                 }
             }
             "2" {
-                try {
-                    $oemChoice = Show-OEMMenu -Action "Download Drivers" -Breadcrumb "Download Drivers"
-                    $oemResult = Resolve-OEMSelection -Selection $oemChoice -MenuItems $OEMMenu
-                    if ($oemResult.Action -eq "back") { continue }
-                    if ($oemResult.Action -eq "invalid") {
-                        Write-Host "  Invalid selection. Use number, first letter, OEM name, or B." -ForegroundColor Yellow
-                        Start-Sleep -Milliseconds 700
-                        continue
-                    }
+                $downloadDriversLoop = $true
+                while ($downloadDriversLoop) {
+                    try {
+                        $oemChoice = Show-OEMMenu -Action "Download Drivers" -Breadcrumb "Download Drivers"
+                        $oemResult = Resolve-OEMSelection -Selection $oemChoice -MenuItems $OEMMenu
+                        if ($oemResult.Action -eq "back") {
+                            $downloadDriversLoop = $false
+                            continue
+                        }
+                        if ($oemResult.Action -eq "invalid") {
+                            Write-Host "  Invalid selection. Use number, first letter, OEM name, or B." -ForegroundColor Yellow
+                            Start-Sleep -Milliseconds 700
+                            continue
+                        }
 
-                    $selectedOEM = $oemResult.OEM
-                    $settings = Get-DASettings
-                    if (-not $selectedOEM.FindCmd) {
+                        $selectedOEM = $oemResult.OEM
+                        $settings = Get-DASettings
+                        if (-not $selectedOEM.FindCmd) {
+                            Write-Host ""
+                            Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
+                            Write-Host ""
+                            & $selectedOEM.GetCmd
+                            Read-Host "  Press Enter to continue"
+                        }
+                        else {
+                            $flowResult = Invoke-CLIDownloadSearchFlow -SelectedOEM $selectedOEM -Settings $settings
+                            if ($flowResult -eq "quit") { return }
+                        }
+
+                        $downloadDriversLoop = $false
+                    }
+                    catch {
+                        Write-LogEntry -Value "[Error] - Download Drivers menu failed: $($_.Exception.Message)" -Severity 3
                         Write-Host ""
-                        Write-Host "  Starting $($selectedOEM.Label) driver workflow..." -ForegroundColor Green
-                        Write-Host ""
-                        & $selectedOEM.GetCmd
+                        Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
                         Read-Host "  Press Enter to continue"
                     }
-                    else {
-                        $flowResult = Invoke-CLIDownloadSearchFlow -SelectedOEM $selectedOEM -Settings $settings
-                        if ($flowResult -eq "quit") { return }
-                    }
-                }
-                catch {
-                    Write-LogEntry -Value "[Error] - Download Drivers menu failed: $($_.Exception.Message)" -Severity 3
-                    Write-Host ""
-                    Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Red
-                    Read-Host "  Press Enter to continue"
                 }
             }
             "3" {
@@ -5181,7 +5613,7 @@ function Start-DATCLI {
                     $global:HPModelXML = $null
                     $global:HPModelDrivers = $null
                     $global:MicrosoftModelDrivers = $null
-                    foreach ($file in @($global:LenovoXMLFile, $global:LenovoXMLCabFile, $global:DellXMLFile, $global:DellXMLCabFile, $global:HPXMLFile, $global:HPXMLCabFile, $global:MicrosoftJSONFile)) {
+                    foreach ($file in @($global:LenovoXMLFile, $global:LenovoXMLCabFile, $global:DellXMLFile, $global:DellXMLCabFile, $global:HPXMLFile, $global:HPXMLCabFile, $global:MicrosoftXMLFile, $global:MicrosoftJSONFile)) {
                         if ($file) {
                             $path = Join-Path $global:TempDirectory $file
                             if (Test-Path $path) {
@@ -5253,3 +5685,4 @@ Export-ModuleMember -Function @(
     'Start-DATCLI',
     'Start-DriverAutomationCLI'
 )
+

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.2.2 - 2026-03-27
+## 2.3.0 - 2026-03-27
 - Refactored `Get-LenovoDrivers`, `Get-DellDrivers`, and `Get-HPDrivers` by centralizing the duplicated package creation, distribution, and cleanup logic into a new shared helper function `Publish-DriverPackage`.
 - Reduced module size and improved long-term maintainability.
 - Updated first-run settings generation so `DASettings.json` defaults `DownloadPath` to `C:\Temp\DATCLI`.
@@ -16,6 +16,19 @@ All notable changes to this project will be documented in this file.
   - Disabled prefix-based stale-package cleanup for Microsoft to retain current behavior
 - Extended `Publish-DriverPackage` with metadata/behavior overrides (`MifName`, `ModelsIncludedValue`, `DisableOldPackageCleanup`) to support OEM-specific nuances cleanly.
 - Fixed post-refactor Lenovo and Dell package-name initialization (`$CMPackageName`) and corrected Dell publish `DisplayModel` usage.
+- Improved Download Drivers OEM selection input handling to accept either numeric options or OEM first-letter/full-name shortcuts while retaining clean numeric menu display.
+- Added Microsoft pack-list display enhancement to include `OSReleaseId` (e.g. `Windows 11 22H2 x64`) when available.
+- Added CLI multi-select for pack choices using comma-separated numbers (e.g. `1,3,5`) with direct sequential execution after selection/force confirmation (no queue workflow).
+- Added explicit CLI-to-log progress telemetry for bulk runs, including per-item progress markers (e.g. `[CLI Bulk 1/2]`), force decisions, failures, and end-of-run summary.
+- Improved cleanup robustness with retry-based temp deletion (`Remove-TempPathRobust`) and stale DATCLI artifact sweeping (`Invoke-StaleTempArtifactCleanup`) while preserving OEM catalog cache files.
+- Reduced console cleanup noise by suppressing transient PowerShell progress output during temp cleanup operations.
+- Fixed Download Drivers OEM invalid input handling to remain in the Download Drivers submenu (instead of returning to the main menu).
+- Updated Model Lookup menu ordering to OEM alphabetical (`Dell`, `HP`, `Lenovo`, `Microsoft`) with `Search all OEMs` as the final selectable option before `Back`.
+- Added Microsoft dual-catalog support in `Find-MicrosoftModel` by merging JSON and XML sources with duplicate suppression.
+- Added support for Microsoft PowerShell CliXML catalog format parsing (`<Objs><Obj><MS><S N=\"...\">...`) so XML-only entries are included in search results.
+- Improved Microsoft model search matching with normalization/fuzzy behavior (e.g. `7` matches `7th`, punctuation/underscore normalization) and matching against `Name` as well as `Model`/`Product`.
+- Fixed Microsoft WIM packaging failures caused by invalid filesystem characters in SKU/model path segments (for example `:`) by introducing shared safe path-segment sanitization and applying it across OEM/custom package destination path construction.
+- Hardened cleanup paths to suppress recursive deletion progress records consistently (including staging-folder deletion), preventing lingering `Removed x of y files` lines at the bottom of interactive sessions.
 
 ## 2.2.1 - 2026-03-26
 - Renamed module branding to `DATCLI` (Driver Automation Tool CLI).
@@ -200,3 +213,4 @@ All notable changes to this project will be documented in this file.
 
 ## 1.0.0 - 2026-03-17
 - Initial release.
+
