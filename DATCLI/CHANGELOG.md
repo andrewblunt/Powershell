@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.2.2 - 2026-03-27
+- Refactored `Get-LenovoDrivers`, `Get-DellDrivers`, and `Get-HPDrivers` by centralizing the duplicated package creation, distribution, and cleanup logic into a new shared helper function `Publish-DriverPackage`.
+- Reduced module size and improved long-term maintainability.
+- Updated first-run settings generation so `DASettings.json` defaults `DownloadPath` to `C:\Temp\DATCLI`.
+- Fixed Microsoft CLI pre-check package-name resolution by carrying `OSReleaseId`/`OSArchitecture` through `Find-MicrosoftModel` and `Resolve-DriverPackageCheckInput`, aligning pre-check naming with `Get-MicrosoftDrivers`.
+- Added shared SCCM package lookup helper `Find-ExistingDriverPackage` and reused it in CLI pre-check and driver workflows for consistent existing-package matching.
+- Completed shared publish-flow migration for `Get-MicrosoftDrivers` while preserving Microsoft-specific behavior:
+  - SKU/Product-based package naming and folder model path
+  - `OSReleaseId`-based OS version handling
+  - `arm64` architecture handling
+  - Model-based `MifName` with SKU in package description
+  - Disabled prefix-based stale-package cleanup for Microsoft to retain current behavior
+- Extended `Publish-DriverPackage` with metadata/behavior overrides (`MifName`, `ModelsIncludedValue`, `DisableOldPackageCleanup`) to support OEM-specific nuances cleanly.
+- Fixed post-refactor Lenovo and Dell package-name initialization (`$CMPackageName`) and corrected Dell publish `DisplayModel` usage.
+
 ## 2.2.1 - 2026-03-26
 - Renamed module branding to `DATCLI` (Driver Automation Tool CLI).
 - Renamed primary module file from `DriverAutomation.psm1` to `DATCLI.psm1`.

@@ -8,8 +8,8 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "2.2.1"
-$ScriptBuildDate = "2026-03-26"
+$ScriptRelease = "2.2.2"
+$ScriptBuildDate = "2026-03-27"
 
 # Hash Tables
 # $WindowsBuildHashTable = @{
@@ -385,6 +385,158 @@ function Write-LogEntry {
 
 # // =================== SHARED PACK HELPERS ====================== //
 
+function Publish-DriverPackage {
+    param (
+        [Parameter(Mandatory = $true)][string]$OEM,
+        [Parameter(Mandatory = $true)][string]$Model,
+        [string]$DisplayModel,
+        [Parameter(Mandatory = $true)][hashtable]$DownloadInfo,
+        [Parameter(Mandatory = $true)][string]$OSName,
+        [string]$OSVersion,
+        [Parameter(Mandatory = $true)][string]$Architecture,
+        [Parameter(Mandatory = $true)][string]$PackageFormat,
+        [Parameter(Mandatory = $true)][string]$SiteServer,
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$CMPackageName,
+        [Parameter(Mandatory = $true)][string]$FinalPackageDest,
+        [string[]]$ModelTypes,
+        [string]$MifName,
+        [string]$ModelsIncludedValue,
+        [switch]$DisableOldPackageCleanup,
+        [switch]$Force,
+        [switch]$SkipDistribution,
+        [bool]$EnableBinaryDeltaReplication = $false
+    )
+
+    $Settings = Get-DASettings
+    $OSDisplay = ($OSName -replace "Windows(\d+)", "Windows $1").Trim()
+    if (-not $DisplayModel) { $DisplayModel = $Model }
+    if (-not $MifName) { $MifName = $DisplayModel }
+
+    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
+
+    $existingLookup = Find-ExistingDriverPackage -SiteServer $SiteServer -PackageName $CMPackageName -PackageVersion $DownloadInfo.Revision -TimeoutSec 30
+    $ExistingPackages = $existingLookup.ExistingPackages
+    $ExistingPackage = $existingLookup.ExistingPackage
+
+    if ($ExistingPackage) {
+        if ($Force) {
+            Write-LogEntry -Value "- Package already exists. Force specified; removing package $($ExistingPackage.PackageID) and source files." -Severity 1
+            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
+            try {
+                if (Test-Path -Path $FinalPackageDest) {
+                    $BackupPath = "${FinalPackageDest}_backup_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
+                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
+                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
+                }
+            }
+            catch {
+                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files: $($_.Exception.Message)" -Severity 2
+            }
+        }
+        else {
+            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
+            Write-LogEntry -Value "======== Get-$($OEM)Drivers Complete (Already Present) ========" -Severity 1
+            return $true
+        }
+    }
+
+    # Download
+    $TempDest = Join-Path $global:TempDirectory -ChildPath $DownloadInfo.FileName
+    if (-not (Invoke-ContentDownload -DownloadURL $DownloadInfo.URL -DestinationPath $TempDest -ModelName $Model)) { return $false }
+
+    if ($OEM -eq "Dell") {
+        $WindowsVersionToken = if ($OSName -match "11") { "11" } else { "10" }
+        $ExtractSubDir = Join-Path $Model -ChildPath ("Windows$WindowsVersionToken-$($DownloadInfo.Revision)")
+        $ExtractSubDir = ($ExtractSubDir -replace '/', '-')
+    }
+    elseif ($OEM -eq "HP") {
+        $WindowsVersionToken = if ($OSName -match "11") { "11" } else { "10" }
+        $ExtractSubDir = ($Model -replace '[/\\]', '-') + "\Win$WindowsVersionToken$Architecture"
+    }
+    else {
+        $ExtractSubDir = "$($Model.Replace(' ', ''))_Drivers_$($DownloadInfo.Revision)"
+    }
+    
+    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
+    if (Test-Path -Path $ExtractDest) {
+        try { Remove-Item -Path $ExtractDest -Recurse -Force -ErrorAction Stop } catch {}
+    }
+
+    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make $OEM)) { return $false }
+
+    $ActualDriverSource = $ExtractDest
+    if ($OEM -eq "HP") { $ActualDriverSource = Get-HPDeepestSingleFolder -RootPath $ExtractDest }
+
+    $PackageRootName = $FinalPackageDest | Split-Path -Leaf
+    if (New-DriverPackage -Make $OEM -DriverExtractDest $ActualDriverSource -Architecture $Architecture -DriverPackageDest $FinalPackageDest -PackageFormat $PackageFormat -PackageRootName $PackageRootName) {
+        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
+    }
+    else {
+        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
+        return $false
+    }
+
+    $MifVersion = "$OSDisplay $Architecture"
+    $SkuValue = if ($ModelsIncludedValue) { $ModelsIncludedValue } elseif ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } else { $DisplayModel }
+    $PackageDescription = "(Models included:$SkuValue)"
+
+    $NewPackage = New-CMPackage -SiteServer $SiteServer -Name $CMPackageName -PkgSourcePath $FinalPackageDest -Manufacturer $OEM -Version $DownloadInfo.Revision -Description $PackageDescription -MifName $MifName -MifVersion $MifVersion -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication
+
+    if (-not $NewPackage -or -not $NewPackage.PackageID) {
+        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
+        return $false
+    }
+    $PackageID = $NewPackage.PackageID
+
+    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\$OEM" -ObjectType 2
+    if ($FolderNodeId) {
+        Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2 | Out-Null
+        Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\$OEM" -Severity 1
+    }
+
+    if (-not $DisableOldPackageCleanup) {
+        $BasePrefix = "Drivers - $OEM $DisplayModel - $OSDisplay "
+        $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
+        $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
+        $OldPackages = $PostPackages | Where-Object { $_.PackageID -ne $PackageID -and $_.Name -like "$BasePrefix*" -and $_.Name -like "* $Architecture" }
+        foreach ($Old in $OldPackages) {
+            Write-LogEntry -Value "- Removing older package $($Old.PackageID) for $DisplayModel $OSDisplay" -Severity 1
+            Remove-CMPackage -SiteServer $SiteServer -PackageID $Old.PackageID | Out-Null
+        }
+    }
+
+    if (-not $SkipDistribution -and $PackageID) {
+        $DPGroups = $Settings.DistributionPointGroups
+        if ($DPGroups -and $DPGroups.Count -gt 0) {
+            Invoke-ContentDistribution -SiteServer $SiteServer -PackageID $PackageID -DistributionPointGroupNames $DPGroups
+        }
+        else {
+            Write-LogEntry -Value "[Warning] - No DP Groups configured." -Severity 2
+        }
+    }
+
+    if ($Settings.CleanupDownloadPath -eq $true) {
+        $previousProgressPreference = $ProgressPreference
+        try {
+            # Suppress noisy Remove-Item progress records that can leave stale lines
+            # at the bottom of the console after large folder cleanup operations.
+            $ProgressPreference = 'SilentlyContinue'
+            foreach ($p in @($TempDest, $ExtractDest)) {
+                if ($p -and (Test-Path -Path $p)) { Remove-Item -Path $p -Recurse -Force -ErrorAction Stop }
+            }
+            Write-Progress -Activity "Cleanup" -Completed
+        }
+        catch {}
+        finally {
+            $ProgressPreference = $previousProgressPreference
+        }
+    }
+
+    Write-LogEntry -Value "======== Get-$($OEM)Drivers Complete ========" -Severity 1
+    return $true
+}
+
 function Select-DriverPackResults {
     <#
     Filters a candidate driver pack list by requested OS family and OS version.
@@ -746,10 +898,10 @@ function Test-DriverPackageExists {
             }
 
             $newerPackage = $candidates |
-                Where-Object { $_.VersionKey -gt $selectedKey } |
-                Sort-Object VersionKey -Descending |
-                Select-Object -First 1 |
-                Select-Object -ExpandProperty Package
+            Where-Object { $_.VersionKey -gt $selectedKey } |
+            Sort-Object VersionKey -Descending |
+            Select-Object -First 1 |
+            Select-Object -ExpandProperty Package
         }
     }
 
@@ -3155,135 +3307,12 @@ function Get-LenovoDrivers {
     
     $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Lenovo") $FolderModel) $FolderName
 
-    # 7. Check if a ConfigMgr package already exists with this version
-    $OSDisplay = ($OSName -replace "Windows(\\d+)", "Windows $1").Trim()
-    $CMPackageName = Build-DriverPackageName -OEM "Lenovo" -Model $Model -OSName $OSDisplay -OSVersion $OSVersion -Architecture $Architecture
-    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
+    # SCCM package name
+    $OSDisplay = ($OSName -replace "Windows(\d+)", "Windows $1").Trim()
+    $CMPackageName = Build-DriverPackageName -OEM "Lenovo" -Model $Model -OSName $OSDisplay -OSVersion $OSVersion -Architecture $FolderArch
 
-    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
-    $ExistingPackage = $ExistingPackages | Where-Object { $_.Version -eq $DownloadInfo.Revision } | Select-Object -First 1
-
-    if ($ExistingPackage) {
-        if ($Force) {
-            Write-LogEntry -Value "- Package already exists for $FolderName. Force specified; removing existing package $($ExistingPackage.PackageID) and source files." -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
-            try {
-                if (Test-Path -Path $FinalPackageDest) {
-                    $Stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-                    $BackupPath = "${FinalPackageDest}_backup_$Stamp"
-                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
-                }
-            }
-            catch {
-                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
-            }
-        }
-        else {
-            Write-LogEntry -Value "- Package already exists for $FolderName (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
-            Write-LogEntry -Value "======== Get-LenovoDrivers Complete (Already Present) ========" -Severity 1
-            return
-        }
-    }
-
-    # 8. Download
-    $TempDest = Join-Path $global:TempDirectory -ChildPath $DownloadInfo.FileName
-    if (-not (Invoke-ContentDownload -DownloadURL $DownloadInfo.URL -DestinationPath $TempDest -ModelName $Model)) {
-        return
-    }
-
-    # 9. Extract
-    $ExtractSubDir = "$($Model.Replace(' ', ''))_Drivers_$($DownloadInfo.Revision)"
-    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
-    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make "Lenovo")) {
-        return
-    }
-
-    # 10. Stage driver files to final UNC package source
-    if (New-DriverPackage -Make "Lenovo" -DriverExtractDest $ExtractDest -Architecture $Architecture -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
-        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
-    }
-    else {
-        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
-        return
-    }
-    
-    # (Cleanup logic has been moved to the end of the function)
-
-
-    # 11. Create SCCM Package via CIM/DCOM
-    $MifVersion = "$OSDisplay $Architecture"
-    $SkuValue = if ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } elseif ($SKU -is [array]) { ($SKU | Select-Object -First 1).SKU } else { $SKU.SKU }
-    $PackageDescription = "(Models included:$SkuValue)"
-
-    # Create a new SCCM package (do not update existing packages)
-    $NewPackage = New-CMPackage -SiteServer $SiteServer `
-        -Name $CMPackageName `
-        -PkgSourcePath $FinalPackageDest `
-        -Manufacturer "Lenovo" `
-        -Version $DownloadInfo.Revision `
-        -Description $PackageDescription `
-        -MifName $Model `
-        -MifVersion $MifVersion `
-        -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication
-
-    if (-not $NewPackage -or -not $NewPackage.PackageID) {
-        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
-        return
-    }
-    $PackageID = $NewPackage.PackageID
-
-    # Place package into "Driver Packages\Lenovo" console folder
-    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\Lenovo" -ObjectType 2
-    if ($FolderNodeId) {
-        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
-            Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\Lenovo" -Severity 1
-        }
-    }
-
-    # 11. Remove older packages for the same model + OS family after successful import
-    if ($PackageID) {
-        $BasePrefix = "Drivers - Lenovo $Model - $OSDisplay "
-        $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
-        $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
-        $OldPackages = $PostPackages | Where-Object {
-            $_.PackageID -ne $PackageID -and
-            $_.Name -like "$BasePrefix*" -and
-            $_.Name -like "* $Architecture"
-        }
-        foreach ($Old in $OldPackages) {
-            Write-LogEntry -Value "- Removing older package $($Old.PackageID) for $Model $OSDisplay (SCCM only; source files retained)" -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $Old.PackageID | Out-Null
-        }
-    }
-
-    # 12. Distribute Content to configured DP Groups
-    if (-not $SkipDistribution -and $PackageID) {
-        $DPGroups = $Settings.DistributionPointGroups
-        if ($DPGroups -and $DPGroups.Count -gt 0) {
-            Invoke-ContentDistribution -SiteServer $SiteServer -PackageID $PackageID -DistributionPointGroupNames $DPGroups
-        }
-        else {
-            Write-LogEntry -Value "[Warning] - No DP Groups configured. Use Set-DASettings to configure." -Severity 2
-        }
-    }
-
-    # 13. Cleanup staging if CleanupDownloadPath is enabled
-    if ($Settings.CleanupDownloadPath -eq $true) {
-        try {
-            foreach ($p in @($TempDest, $ExtractDest)) {
-                if ($p -and (Test-Path -Path $p)) {
-                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
-                }
-            }
-        }
-        catch {
-            Write-LogEntry -Value "[Warning] - Cleanup failed: $($_.Exception.Message)" -Severity 2
-        }
-    }
-
-    Write-LogEntry -Value "======== Get-LenovoDrivers Complete ========" -Severity 1
+    # Consolidate duplicate workflow
+    Publish-DriverPackage -OEM "Lenovo" -Model $Model -DisplayModel $Model -DownloadInfo $DownloadInfo -OSName $OSName -OSVersion $OSVersion -Architecture $FolderArch -PackageFormat $EffectivePackageFormat -SiteServer $SiteServer -PackagePath $PackagePath -CMPackageName $CMPackageName -FinalPackageDest $FinalPackageDest -ModelTypes $ModelTypes -Force:$Force -SkipDistribution:$SkipDistribution -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication | Out-Null
 }
 
 function Get-DellDrivers {
@@ -3598,148 +3627,12 @@ function Get-DellDrivers {
     
     $FinalPackageDest = Join-Path (Join-Path (Join-Path $PackagePath "Dell") $DisplayModel) $FolderName
 
-    # 6. Check if a ConfigMgr package already exists with this version
-    $OSDisplay = ($SelectedPackOsName -replace "Windows(\\d+)", "Windows $1").Trim()
+    # SCCM package name (Dell may intentionally omit OS version)
+    $OSDisplay = ($SelectedPackOsName -replace "Windows(\d+)", "Windows $1").Trim()
     $CMPackageName = Build-DriverPackageName -OEM "Dell" -Model $Model -OSName $OSDisplay -OSVersion $OSVersion -Architecture $SelectedPackArch
-    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
 
-    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
-    $ExistingPackage = $ExistingPackages | Where-Object { $_.Version -eq $DownloadInfo.Revision } | Select-Object -First 1
-
-    if ($ExistingPackage) {
-        if ($Force) {
-            Write-LogEntry -Value "- Package already exists for $FolderName. Force specified; removing existing package $($ExistingPackage.PackageID) and source files." -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
-            try {
-                if (Test-Path -Path $FinalPackageDest) {
-                    $Stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-                    $BackupPath = "${FinalPackageDest}_backup_$Stamp"
-                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
-                }
-            }
-            catch {
-                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
-            }
-        }
-        else {
-            Write-LogEntry -Value "- Package already exists for $FolderName (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
-            Write-LogEntry -Value "======== Get-DellDrivers Complete (Already Present) ========" -Severity 1
-            return
-        }
-    }
-
-    # 7. Download
-    $TempDest = Join-Path $global:TempDirectory -ChildPath $DownloadInfo.FileName
-    if (-not (Invoke-ContentDownload -DownloadURL $DownloadInfo.URL -DestinationPath $TempDest -ModelName $Model)) {
-        return
-    }
-    if (-not (Test-Path -Path $TempDest)) {
-        Write-LogEntry -Value "[Error] - Download reported success but file not found: $TempDest" -Severity 3
-        return
-    }
-
-    # 8. Extract (mirror original Dell behavior: Temp\<Model>\Windows<Version>-<Revision>)
-    $WindowsVersionToken = if ($SelectedPackOsName -match "11") { "11" } else { "10" }
-    $ExtractSubDir = Join-Path $Model -ChildPath ("Windows$WindowsVersionToken-$($DownloadInfo.Revision)")
-    $ExtractSubDir = ($ExtractSubDir -replace '/', '-')
-    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
-    if (Test-Path -Path $ExtractDest) {
-        try {
-            Remove-Item -Path $ExtractDest -Recurse -Force -ErrorAction Stop
-        }
-        catch {
-            Write-LogEntry -Value "[Warning] - Failed to clear existing Dell extract folder ${ExtractDest}: $($_.Exception.Message)" -Severity 2
-        }
-    }
-    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make "Dell")) {
-        return
-    }
-
-    # 9. Stage driver files to final UNC package source
-    if (New-DriverPackage -Make "Dell" -DriverExtractDest $ExtractDest -Architecture $SelectedPackArch -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
-        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
-    }
-    else {
-        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
-        return
-    }
-
-    # (Cleanup logic has been moved to the end of the function)
-
-
-    # 10. Create SCCM Package via CIM/DCOM
-    $MifVersion = "$OSDisplay $SelectedPackArch"
-    $SkuValue = if ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } else { $Model }
-    $PackageDescription = "(Models included:$SkuValue)"
-
-    $NewPackage = New-CMPackage -SiteServer $SiteServer `
-        -Name $CMPackageName `
-        -PkgSourcePath $FinalPackageDest `
-        -Manufacturer "Dell" `
-        -Version $DownloadInfo.Revision `
-        -Description $PackageDescription `
-        -MifName $Model `
-        -MifVersion $MifVersion `
-        -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication
-
-    if (-not $NewPackage -or -not $NewPackage.PackageID) {
-        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
-        return
-    }
-    $PackageID = $NewPackage.PackageID
-
-    # Place package into "Driver Packages\Dell" console folder
-    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\Dell" -ObjectType 2
-    if ($FolderNodeId) {
-        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
-            Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\Dell" -Severity 1
-        }
-    }
-
-    # 11. Remove older packages for the same model + OS family after successful import
-    if ($PackageID) {
-        $BasePrefix = "Drivers - Dell $Model - $OSDisplay "
-        $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
-        $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
-        $OldPackages = $PostPackages | Where-Object {
-            $_.PackageID -ne $PackageID -and
-            $_.Name -like "$BasePrefix*" -and
-            $_.Name -like "* $SelectedPackArch"
-        }
-        foreach ($Old in $OldPackages) {
-            Write-LogEntry -Value "- Removing older package $($Old.PackageID) for $Model $OSDisplay (SCCM only; source files retained)" -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $Old.PackageID | Out-Null
-        }
-    }
-
-    # 12. Distribute Content to configured DP Groups
-    if (-not $SkipDistribution -and $PackageID) {
-        $DPGroups = $Settings.DistributionPointGroups
-        if ($DPGroups -and $DPGroups.Count -gt 0) {
-            Invoke-ContentDistribution -SiteServer $SiteServer -PackageID $PackageID -DistributionPointGroupNames $DPGroups
-        }
-        else {
-            Write-LogEntry -Value "[Warning] - No DP Groups configured. Use Set-DASettings to configure." -Severity 2
-        }
-    }
-
-    # 13. Cleanup staging if CleanupDownloadPath is enabled
-    if ($Settings.CleanupDownloadPath -eq $true) {
-        try {
-            foreach ($p in @($TempDest, $ExtractDest)) {
-                if ($p -and (Test-Path -Path $p)) {
-                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
-                }
-            }
-        }
-        catch {
-            Write-LogEntry -Value "[Warning] - Cleanup failed for ${TempDest} or ${ExtractDest}: $($_.Exception.Message)" -Severity 2
-        }
-    }
-
-    Write-LogEntry -Value "======== Get-DellDrivers Complete ========" -Severity 1
+    # Consolidate duplicate workflow
+    Publish-DriverPackage -OEM "Dell" -Model $Model -DisplayModel $DisplayModel -DownloadInfo $DownloadInfo -OSName $SelectedPackOsName -OSVersion $OSVersion -Architecture $SelectedPackArch -PackageFormat $EffectivePackageFormat -SiteServer $SiteServer -PackagePath $PackagePath -CMPackageName $CMPackageName -FinalPackageDest $FinalPackageDest -ModelTypes $ModelTypes -Force:$Force -SkipDistribution:$SkipDistribution -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication | Out-Null
 }
 
 function Get-HPDrivers {
@@ -4132,154 +4025,8 @@ function Get-HPDrivers {
     $OSDisplay = $SelectedPackOsName   # Already "Windows 10" / "Windows 11"
     $CMPackageName = Build-DriverPackageName -OEM "HP" -Model $Model -OSName $OSDisplay -OSVersion $OSVersion -Architecture $SelectedPackArch
 
-    # -------------------------------------------------------------------------
-    # 7. Check for existing SCCM package
-    # -------------------------------------------------------------------------
-    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
-    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
-    $ExistingPackage = $ExistingPackages | Where-Object { $_.Version -eq $DownloadInfo.Revision } | Select-Object -First 1
-
-    if ($ExistingPackage) {
-        if ($Force) {
-            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Force specified; removing." -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
-            try {
-                if (Test-Path -Path $FinalPackageDest) {
-                    $BackupPath = "${FinalPackageDest}_backup_$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
-                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Archived existing source files to $BackupPath" -Severity 1
-                }
-            }
-            catch {
-                Write-LogEntry -Value "[Warning] - Failed to archive source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
-            }
-        }
-        else {
-            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
-            Write-LogEntry -Value "======== Get-HPDrivers Complete (Already Present) ========" -Severity 1
-            return
-        }
-    }
-
-    # -------------------------------------------------------------------------
-    # 8. Download
-    # -------------------------------------------------------------------------
-    $TempDest = Join-Path $global:TempDirectory -ChildPath $DownloadInfo.FileName
-    if (-not (Invoke-ContentDownload -DownloadURL $DownloadInfo.URL -DestinationPath $TempDest -ModelName $Model)) {
-        return
-    }
-
-    # -------------------------------------------------------------------------
-    # 9. Extract
-    # -------------------------------------------------------------------------
-    $WindowsVersionToken = if ($SelectedPackOsName -match "11") { "11" } else { "10" }
-    $ExtractSubDir = ($Model -replace '[/\\]', '-') + "\Win$WindowsVersionToken$SelectedPackArch"
-    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
-
-    if (Test-Path -Path $ExtractDest) {
-        try { Remove-Item -Path $ExtractDest -Recurse -Force -ErrorAction Stop }
-        catch { Write-LogEntry -Value "[Warning] - Could not clear extract folder ${ExtractDest}: $($_.Exception.Message)" -Severity 2 }
-    }
-
-    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make "HP")) {
-        return
-    }
-
-    # -------------------------------------------------------------------------
-    # 9a. Wrap extracted content under a versioned sub-folder so the SCCM package
-    #     source has a clean, self-describing root (avoids a flat driver dump).
-    # -------------------------------------------------------------------------
-    # Find the actual driver root (HP SoftPaqs often have a nested folder)
-    $ActualDriverSource = Get-HPDeepestSingleFolder -RootPath $ExtractDest
-
-    # Stage to final UNC destination using the folder name as the internal root
-    if (New-DriverPackage -Make "HP" -DriverExtractDest $ActualDriverSource -Architecture $SelectedPackArch -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
-        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
-    }
-    else {
-        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
-        return
-    }
-
-    # (Cleanup logic has been moved to the end of the function)
-
-
-    # -------------------------------------------------------------------------
-    # 11. Create SCCM package
-    # -------------------------------------------------------------------------
-    $MifVersion = "$OSDisplay $SelectedPackArch"
-    $SkuValue = if ($ModelTypes -and $ModelTypes.Count -gt 0) { ($ModelTypes -join ",") } else { $DisplayModel }
-    $PackageDescription = "(Models included:$SkuValue)"
-
-    $NewPackage = New-CMPackage -SiteServer $SiteServer `
-        -Name $CMPackageName `
-        -PkgSourcePath $FinalPackageDest `
-        -Manufacturer "HP" `
-        -Version $DownloadInfo.Revision `
-        -Description $PackageDescription `
-        -MifName $DisplayModel `
-        -MifVersion $MifVersion `
-        -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication
-
-    if (-not $NewPackage -or -not $NewPackage.PackageID) {
-        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
-        return
-    }
-    $PackageID = $NewPackage.PackageID
-
-    # Place package into "Driver Packages\HP" console folder
-    $FolderNodeId = Resolve-CMFolderPath -Path "Driver Packages\\HP" -ObjectType 2
-    if ($FolderNodeId) {
-        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
-            Write-LogEntry -Value "- Package $PackageID placed in console folder: Driver Packages\\HP" -Severity 1
-        }
-    }
-
-    # -------------------------------------------------------------------------
-    # 12. Remove stale packages for the same model + OS family
-    # -------------------------------------------------------------------------
-    $BasePrefix = "Drivers - HP $DisplayModel - $OSDisplay "
-    $EscPrefix = ConvertTo-WqlEscapedString $BasePrefix
-    $PostPackages = Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'$EscPrefix')"
-    $OldPackages = $PostPackages | Where-Object {
-        $_.PackageID -ne $PackageID -and
-        $_.Name -like "$BasePrefix*" -and
-        $_.Name -like "* $SelectedPackArch"
-    }
-    foreach ($Old in $OldPackages) {
-        Write-LogEntry -Value "- Removing older package $($Old.PackageID) for $DisplayModel $OSDisplay (SCCM only; source files retained)" -Severity 1
-        Remove-CMPackage -SiteServer $SiteServer -PackageID $Old.PackageID | Out-Null
-    }
-
-    # -------------------------------------------------------------------------
-    # 13. Distribute content
-    # -------------------------------------------------------------------------
-    if (-not $SkipDistribution -and $PackageID) {
-        $DPGroups = $Settings.DistributionPointGroups
-        if ($DPGroups -and $DPGroups.Count -gt 0) {
-            Invoke-ContentDistribution -SiteServer $SiteServer -PackageID $PackageID -DistributionPointGroupNames $DPGroups
-        }
-        else {
-            Write-LogEntry -Value "[Warning] - No DP Groups configured. Use Set-DASettings to configure." -Severity 2
-        }
-    }
-
-    # 14. Cleanup staging if CleanupDownloadPath is enabled
-    if ($Settings.CleanupDownloadPath -eq $true) {
-        try {
-            foreach ($p in @($TempDest, $ExtractDest)) {
-                if ($p -and (Test-Path -Path $p)) {
-                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
-                }
-            }
-        }
-        catch {
-            Write-LogEntry -Value "[Warning] - Cleanup failed for ${TempDest} or ${ExtractDest}: $($_.Exception.Message)" -Severity 2
-        }
-    }
-
-    Write-LogEntry -Value "======== Get-HPDrivers Complete ========" -Severity 1
+    # Consolidate duplicate workflow
+    Publish-DriverPackage -OEM "HP" -Model $Model -DisplayModel $DisplayModel -DownloadInfo $DownloadInfo -OSName $SelectedPackOsName -OSVersion $OSVersion -Architecture $SelectedPackArch -PackageFormat $EffectivePackageFormat -SiteServer $SiteServer -PackagePath $PackagePath -CMPackageName $CMPackageName -FinalPackageDest $FinalPackageDest -ModelTypes $ModelTypes -Force:$Force -SkipDistribution:$SkipDistribution -EnableBinaryDeltaReplication $EnableBinaryDeltaReplication | Out-Null
 }
 
 # // =================== MICROSOFT DRIVER LOGIC ====================== //
@@ -4367,12 +4114,12 @@ function Find-MicrosoftModel {
         $Results = foreach ($pack in $global:MicrosoftModelDrivers) {
             if (($pack.Model -like $modelPattern) -or ($pack.Product -like $modelPattern)) {
                 [pscustomobject]@{
-                    Name     = $pack.Model
-                    SKU      = $pack.Product
-                    OS       = $pack.OSVersion
-                    OSReleaseId = $pack.OSReleaseId
+                    Name           = $pack.Model
+                    SKU            = $pack.Product
+                    OS             = $pack.OSVersion
+                    OSReleaseId    = $pack.OSReleaseId
                     OSArchitecture = $pack.OSArchitecture
-                    FileName = $pack.FileName
+                    FileName       = $pack.FileName
                 }
             }
         }
@@ -4535,114 +4282,15 @@ function Get-MicrosoftDrivers {
     $OSDisplay = $SelectedOSName
     $CMPackageName = Build-DriverPackageName -OEM "Microsoft" -Model $SelectedPack.Product -OSName $OSDisplay -OSVersion $SelectedOSVersion -Architecture $SelectedArchitecture
 
-    Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
-
-    # 10. Check for existing package
-    $existingLookup = Find-ExistingDriverPackage -SiteServer $SiteServer -PackageName $CMPackageName -PackageVersion $SelectedRevision -TimeoutSec 30
-    $ExistingPackages = $existingLookup.ExistingPackages
-    $ExistingPackage = $existingLookup.ExistingPackage
-
-    if ($ExistingPackage) {
-        if ($Force) {
-            Write-LogEntry -Value "- Package already exists. Force specified; removing existing package $($ExistingPackage.PackageID) and source files." -Severity 1
-            Remove-CMPackage -SiteServer $SiteServer -PackageID $ExistingPackage.PackageID | Out-Null
-            try {
-                if (Test-Path -Path $FinalPackageDest) {
-                    $Stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-                    $BackupPath = "${FinalPackageDest}_backup_$Stamp"
-                    Move-Item -Path $FinalPackageDest -Destination $BackupPath -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Archived existing package source files to $BackupPath" -Severity 1
-                }
-            }
-            catch {
-                Write-LogEntry -Value "[Warning] - Failed to archive existing package source files at ${FinalPackageDest}: $($_.Exception.Message)" -Severity 2
-            }
-        }
-        else {
-            Write-LogEntry -Value "- Package already exists (PackageID: $($ExistingPackage.PackageID)). Skipping." -Severity 1
-            Write-LogEntry -Value "======== Get-MicrosoftDrivers Complete (Already Present) ========" -Severity 1
-            return
-        }
+    $DownloadInfo = @{
+        URL      = $SelectedPack.Url
+        FileName = $SelectedPack.FileName
+        Revision = $SelectedRevision
     }
 
-    # 11. Download
-    $TempDest = Join-Path $global:TempDirectory -ChildPath $SelectedPack.FileName
-    if (-not (Invoke-ContentDownload -DownloadURL $SelectedPack.Url -DestinationPath $TempDest -ModelName $SelectedModel)) {
-        return
-    }
-
-    # 12. Extract
-    $ExtractSubDir = "$($SelectedModel.Replace(' ', ''))_Drivers_$SelectedRevision"
-    $ExtractDest = Join-Path $global:TempDirectory -ChildPath $ExtractSubDir
-    if (-not (Invoke-ContentExtraction -SourceFile $TempDest -DestinationFolder $ExtractDest -Make "Microsoft")) {
-        return
-    }
-
-    # 13. Stage driver files
-    if (New-DriverPackage -Make "Microsoft" -DriverExtractDest $ExtractDest -Architecture $SelectedArchitecture -DriverPackageDest $FinalPackageDest -PackageFormat $EffectivePackageFormat -PackageRootName $FolderName) {
-        Write-LogEntry -Value "- Driver files staged to $FinalPackageDest" -Severity 1
-    }
-    else {
-        Write-LogEntry -Value "[Error] - Failed to stage driver files." -Severity 3
-        return
-    }
-
-    # 14. Create SCCM Package
-    $MifVersion = "$OSDisplay $SelectedArchitecture"
-    $SkuValue = $SelectedPack.Product
-    $PackageDescription = "(Models included:$SkuValue)"
-
-    $NewPackage = New-CMPackage -SiteServer $SiteServer `
-        -Name $CMPackageName `
-        -PkgSourcePath $FinalPackageDest `
-        -Manufacturer "Microsoft" `
-        -Version $SelectedRevision `
-        -Description $PackageDescription `
-        -MifName $SelectedModel `
-        -MifVersion $MifVersion `
-        -EnableBinaryDeltaReplication $Settings.EnableBinaryDeltaReplication
-
-    if (-not $NewPackage -or -not $NewPackage.PackageID) {
-        Write-LogEntry -Value "[Error] - Failed to create SCCM package." -Severity 3
-        return
-    }
-    $PackageID = $NewPackage.PackageID
-    Write-LogEntry -Value "- SCCM package created: $PackageID" -Severity 1
-
-    # 15. Place package into "Driver Packages\Microsoft" console folder
-    $ConsoleFolder = "Driver Packages\\Microsoft"
-    $FolderNodeId = Resolve-CMFolderPath -Path $ConsoleFolder -ObjectType 2
-    if ($FolderNodeId) {
-        if (Add-CMPackageToFolder -PackageID $PackageID -FolderNodeId $FolderNodeId -ObjectType 2) {
-            Write-LogEntry -Value "- Package $PackageID placed in console folder: $ConsoleFolder" -Severity 1
-        }
-    }
-
-    # 16. Distribute content to DP Groups
-    if (-not $SkipDistribution) {
-        if ($Settings.DistributionPointGroups -and $Settings.DistributionPointGroups.Count -gt 0) {
-            Invoke-ContentDistribution -SiteServer $SiteServer `
-                -PackageID $PackageID `
-                -DistributionPointGroupNames $Settings.DistributionPointGroups
-        }
-    }
-
-    # 17. Cleanup
-    if ($Settings.CleanupDownloadPath) {
-        try {
-            foreach ($p in @($TempDest, $ExtractDest)) {
-                if ($p -and (Test-Path -Path $p)) {
-                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
-                    Write-LogEntry -Value "- Cleanup: Removed $p" -Severity 1
-                }
-            }
-        }
-        catch {
-            Write-LogEntry -Value "[Warning] - Cleanup failed for ${TempDest} or ${ExtractDest}: $($_.Exception.Message)" -Severity 2
-        }
-    }
-
-    Write-LogEntry -Value "======== Get-MicrosoftDrivers Complete ========" -Severity 1
+    # Consolidate duplicate workflow (Microsoft nuance: SKU in package naming/description,
+    # model as MIF name, and no stale-package cleanup sweep by prefix).
+    Publish-DriverPackage -OEM "Microsoft" -Model $SelectedModel -DisplayModel $SelectedPack.Product -DownloadInfo $DownloadInfo -OSName $SelectedOSName -OSVersion $SelectedOSVersion -Architecture $SelectedArchitecture -PackageFormat $EffectivePackageFormat -SiteServer $SiteServer -PackagePath $PackagePath -CMPackageName $CMPackageName -FinalPackageDest $FinalPackageDest -MifName $SelectedModel -ModelsIncludedValue $SelectedPack.Product -DisableOldPackageCleanup -Force:$Force -SkipDistribution:$SkipDistribution -EnableBinaryDeltaReplication $Settings.EnableBinaryDeltaReplication | Out-Null
 }
 
 # // =================== CUSTOM DRIVER LOGIC ====================== //
@@ -5566,6 +5214,3 @@ Export-ModuleMember -Function @(
     'Start-DATCLI',
     'Start-DriverAutomationCLI'
 )
-
-
-

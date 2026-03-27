@@ -1,6 +1,6 @@
 # DATCLI (Driver Automation Tool CLI)
 
-Current version: **2.2.1**
+Current version: **2.2.2**
 See `CHANGELOG.md` for release history.
 
 A modular PowerShell CLI for automating driver pack download, extraction, SCCM package creation, and distribution. Supports Lenovo, Dell, HP, Microsoft Surface, and custom driver packages. Designed for ConfigMgr environments with an interactive menu-driven interface.
@@ -48,7 +48,7 @@ A modular PowerShell CLI for automating driver pack download, extraction, SCCM p
 The `Start-DATCLI` command launches a menu-driven interface:
 
 ```
-  DATCLI 2.2.1 > Main Menu
+  DATCLI 2.2.2 > Main Menu
 
     Connected:  your.sccm.server
     Catalogs:   LenovoXML 3.2h | DellXML 3.2h | HPXML 3.2h | build-driverpack 3.2h
