@@ -1,6 +1,6 @@
-# Driver Automation Tool
+# DATCLI (Driver Automation Tool CLI)
 
-Current version: **2.2.0**
+Current version: **2.2.1**
 See `CHANGELOG.md` for release history.
 
 A modular PowerShell CLI for automating driver pack download, extraction, SCCM package creation, and distribution. Supports Lenovo, Dell, HP, Microsoft Surface, and custom driver packages. Designed for ConfigMgr environments with an interactive menu-driven interface.
@@ -28,15 +28,15 @@ A modular PowerShell CLI for automating driver pack download, extraction, SCCM p
 
 2. Import the module:
    ```powershell
-   Import-Module .\DriverAutomation.psm1 -Force
+   Import-Module .\DATCLI.psd1 -Force
    ```
 
 3. Launch the interactive CLI:
    ```powershell
-   Start-DriverAutomationCLI
+   Start-DATCLI
    ```
 
-   Or run `.\DriverAutomationCLI.ps1` directly.
+   Or run `.\DATCLI.ps1` directly.
 
 4. First-time setup will create `DASettings.json` with blank values. Configure via Settings menu or:
    ```powershell
@@ -45,10 +45,10 @@ A modular PowerShell CLI for automating driver pack download, extraction, SCCM p
 
 ## Interactive CLI
 
-The `Start-DriverAutomationCLI` command launches a menu-driven interface:
+The `Start-DATCLI` command launches a menu-driven interface:
 
 ```
-  Driver Automation Tool 2.2.0 > Main Menu
+  DATCLI 2.2.1 > Main Menu
 
     Connected:  your.sccm.server
     Catalogs:   LenovoXML 3.2h | DellXML 3.2h | HPXML 3.2h | build-driverpack 3.2h
@@ -151,6 +151,7 @@ Set-DASettings
 
 | Function | Description |
 |----------|-------------|
+| `Start-DATCLI` | Interactive menu-driven interface |
 | `Start-DriverAutomationCLI` | Interactive menu-driven interface |
 | `Get-LenovoDrivers` | Download and package Lenovo drivers |
 | `Find-LenovoModel` | Search Lenovo catalog |

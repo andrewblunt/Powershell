@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.2.1 - 2026-03-26
+- Renamed module branding to `DATCLI` (Driver Automation Tool CLI).
+- Renamed primary module file from `DriverAutomation.psm1` to `DATCLI.psm1`.
+- Added module manifest `DATCLI.psd1` for standard PowerShell module import/version metadata.
+- Renamed primary launcher script to `DATCLI.ps1`.
+- Added backward-compatible launcher wrapper `DriverAutomationCLI.ps1` that forwards to `DATCLI.ps1`.
+- Renamed primary interactive command to `Start-DATCLI`.
+- Added backward-compatible `Start-DriverAutomationCLI` wrapper that calls `Start-DATCLI`.
+- Updated README and agent guidance to reference `DATCLI` naming and version `2.2.1`.
+
 ## 2.2.0 - 2026-03-26
 - Refactored `Start-DriverAutomationCLI` into smaller internal helper flows (pack display, pack selection, pre-check, action selection, and invocation) to reduce nested logic and improve maintainability.
 - Added clearer structured download flow handling (`Invoke-CLIDownloadSearchFlow`) while preserving current CLI behavior.

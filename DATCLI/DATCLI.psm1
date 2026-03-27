@@ -1,5 +1,5 @@
 # // ==============================================================================
-# // DriverAutomation.psm1
+# // DATCLI.psm1
 # // Driver Automation CLI - Modular headless driver automation for SCCM
 # // Focus: Lenovo, Dell, HP & Configuration Manager
 # // ==============================================================================
@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "2.2.0"
+$ScriptRelease = "2.2.1"
 $ScriptBuildDate = "2026-03-26"
 
 # Hash Tables
@@ -73,7 +73,7 @@ foreach ($Folder in @($global:TempDirectory, $global:LogDirectory)) {
 function Get-DASettings {
     <#
     .SYNOPSIS
-        Retrieves Driver Automation Tool settings from the JSON configuration file.
+        Retrieves DATCLI settings from the JSON configuration file.
     .DESCRIPTION
         Loads configuration from DASettings.json. If the file does not exist, it creates a default one.
     .EXAMPLE
@@ -147,7 +147,7 @@ function Convert-OSName {
 function Set-DASettings {
     <#
     .SYNOPSIS
-        Updates the Driver Automation Tool JSON configuration file.
+        Updates the DATCLI JSON configuration file.
     .DESCRIPTION
         Saves updated settings to DASettings.json to be used as defaults for future runs.
         ConfigMgr connectivity uses CIM/DCOM (no WinRM).
@@ -346,7 +346,7 @@ function Write-LogEntry {
         [Parameter(Mandatory = $true)]
         [ValidateSet('1', '2', '3')]
         [string]$Severity,
-        [string]$FileName = "DriverAutomationTool.log",
+        [string]$FileName = "DATCLI.log",
         [bool]$WriteOutput = $true
     )
     
@@ -770,7 +770,7 @@ function Get-OEMLinks {
 }
 
 $global:OEMLinks = Get-OEMLinks
-Write-LogEntry -Value "Driver Automation Tool $ScriptRelease module loaded ($ScriptBuildDate)" -Severity 1
+Write-LogEntry -Value "DATCLI $ScriptRelease module loaded ($ScriptBuildDate)" -Severity 1
 
 # Lenovo Variables
 $LenovoXMLSource = ($global:OEMLinks.OEM.Manufacturer | Where-Object {
@@ -5034,10 +5034,10 @@ function Update-Packages {
 
 # // =================== INTERACTIVE CLI ====================== //
 
-function Start-DriverAutomationCLI {
+function Start-DATCLI {
     <#
     .SYNOPSIS
-        Launches an interactive command-line interface for the Driver Automation Tool.
+        Launches an interactive command-line interface for the DATCLI.
     #>
     [CmdletBinding()]
     param ()
@@ -5055,7 +5055,7 @@ function Start-DriverAutomationCLI {
         Clear-Host
         Write-Host ""
         Write-Host "  ==============================================" -ForegroundColor DarkCyan
-        Write-Host "   Driver Automation Tool $ScriptRelease > $Breadcrumb" -ForegroundColor White
+        Write-Host "   DATCLI $ScriptRelease > $Breadcrumb" -ForegroundColor White
         Write-Host "  ==============================================" -ForegroundColor DarkCyan
     }
 
@@ -5461,6 +5461,18 @@ function Start-DriverAutomationCLI {
         }
     }
 }
+
+function Start-DriverAutomationCLI {
+    <#
+    .SYNOPSIS
+        Backward-compatible wrapper for Start-DATCLI.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Start-DATCLI
+}
+
 # Export functions - only user-facing commands
 Export-ModuleMember -Function @(
     # Settings
@@ -5485,7 +5497,9 @@ Export-ModuleMember -Function @(
     'Find-DriverModel',
     'Update-Packages',
     # Interactive CLI
+    'Start-DATCLI',
     'Start-DriverAutomationCLI'
 )
+
 
 
