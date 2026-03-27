@@ -89,7 +89,7 @@ function Get-DASettings {
             SiteCode                     = ""
             SCCMNamespace                = ""
             PackagePath                  = ""
-            DownloadPath                 = $global:TempDirectory
+            DownloadPath                 = "C:\Temp\DATCLI"
             PackageFormat                = "Raw"
             CleanupDownloadPath          = $false
             DistributionPointGroups      = @()
@@ -595,6 +595,8 @@ function Resolve-DriverPackageCheckInput {
     $osName = $null
     $osVersion = $null
     $architecture = $null
+    $selectedOsRelease = [string]$SelectedModel.OSReleaseId
+    $selectedArchitecture = [string]$SelectedModel.OSArchitecture
 
     if ($osRaw) {
         if ($osRaw -match '(?i)(windows\s*11|win11)') {
@@ -619,6 +621,24 @@ function Resolve-DriverPackageCheckInput {
         }
         elseif ($osRaw -match '(?i)(x86|32-bit)') {
             $architecture = "x86"
+        }
+    }
+
+    # Prefer explicit catalog OS release metadata when present (notably Microsoft),
+    # so pre-check naming matches the downstream Get-*Drivers package naming.
+    if ($selectedOsRelease -and $selectedOsRelease -match '(?i)^(\d{2}H[12]|\d{4})$') {
+        $osVersion = $Matches[1].ToUpper()
+    }
+
+    if (-not $architecture -and $selectedArchitecture) {
+        if ($selectedArchitecture -match '(?i)arm') {
+            $architecture = "arm64"
+        }
+        elseif ($selectedArchitecture -match '(?i)(x86|32)') {
+            $architecture = "x86"
+        }
+        else {
+            $architecture = "x64"
         }
     }
 
@@ -695,7 +715,8 @@ function Test-DriverPackageExists {
         }
     }
 
-    $existing = Get-CMPackage -SiteServer $SiteServer -Name $checkInput.PackageName -TimeoutSec $TimeoutSec | Select-Object -First 1
+    $existingLookup = Find-ExistingDriverPackage -SiteServer $SiteServer -PackageName $checkInput.PackageName -TimeoutSec $TimeoutSec
+    $existing = $existingLookup.ExistingPackage
     $newerPackage = $null
     $relatedPackages = @()
 
@@ -740,6 +761,48 @@ function Test-DriverPackageExists {
         NewerPackage    = $newerPackage
         RelatedPackages = $relatedPackages
         CheckInput      = $checkInput
+    }
+}
+
+function Find-ExistingDriverPackage {
+    <#
+    .SYNOPSIS
+        Shared SCCM package existence lookup by package name.
+    .DESCRIPTION
+        Returns the matching package set and a selected package (first match or
+        revision-matched package when PackageVersion is provided).
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$SiteServer,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName,
+
+        [string]$PackageVersion,
+
+        [int]$TimeoutSec = 30
+    )
+
+    $packages = @(Get-CMPackage -SiteServer $SiteServer -Name $PackageName -TimeoutSec $TimeoutSec)
+    if (-not $packages -or $packages.Count -eq 0) {
+        return [pscustomobject]@{
+            ExistingPackage  = $null
+            ExistingPackages = @()
+        }
+    }
+
+    $existing = if ($PackageVersion) {
+        $packages | Where-Object { $_.Version -eq $PackageVersion } | Select-Object -First 1
+    }
+    else {
+        $packages | Select-Object -First 1
+    }
+
+    return [pscustomobject]@{
+        ExistingPackage  = $existing
+        ExistingPackages = $packages
     }
 }
 
@@ -4307,6 +4370,8 @@ function Find-MicrosoftModel {
                     Name     = $pack.Model
                     SKU      = $pack.Product
                     OS       = $pack.OSVersion
+                    OSReleaseId = $pack.OSReleaseId
+                    OSArchitecture = $pack.OSArchitecture
                     FileName = $pack.FileName
                 }
             }
@@ -4473,8 +4538,9 @@ function Get-MicrosoftDrivers {
     Write-LogEntry -Value "- Checking for existing SCCM package: $CMPackageName" -Severity 1
 
     # 10. Check for existing package
-    $ExistingPackages = Get-CMPackage -SiteServer $SiteServer -Name $CMPackageName -TimeoutSec 30
-    $ExistingPackage = $ExistingPackages | Where-Object { $_.Version -eq $SelectedRevision } | Select-Object -First 1
+    $existingLookup = Find-ExistingDriverPackage -SiteServer $SiteServer -PackageName $CMPackageName -PackageVersion $SelectedRevision -TimeoutSec 30
+    $ExistingPackages = $existingLookup.ExistingPackages
+    $ExistingPackage = $existingLookup.ExistingPackage
 
     if ($ExistingPackage) {
         if ($Force) {
