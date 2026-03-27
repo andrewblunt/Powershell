@@ -8,7 +8,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script Build Information
-$ScriptRelease = "2.3.0"
+$ScriptRelease = "2.4.0"
 $ScriptBuildDate = "2026-03-27"
 
 # Hash Tables
@@ -4827,6 +4827,318 @@ function Get-CustomDrivers {
 
 # // =================== PACKAGE MANAGEMENT ====================== //
 
+function ConvertTo-NormalizedOSName {
+    [CmdletBinding()]
+    param (
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $trimmed = $Value.Trim()
+
+    if ($trimmed -match '(?i)(windows\s*11|^11$|win11)') { return "Windows 11" }
+    if ($trimmed -match '(?i)(windows\s*10|^10$|win10)') { return "Windows 10" }
+    return $trimmed
+}
+
+function Parse-DriverPackageName {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $parsed = [regex]::Match($Name, '^Drivers\s*-\s*(?<LabelModel>.+?)\s*-\s*(?<OSSegment>Windows\s+.+)$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $parsed.Success) { return $null }
+
+    $labelModel = $parsed.Groups['LabelModel'].Value.Trim()
+    $osSegment = $parsed.Groups['OSSegment'].Value.Trim()
+
+    $osName = $null
+    $osVersion = $null
+    $architecture = $null
+
+    $osMatch = [regex]::Match($osSegment, '^(?<OSName>Windows\s+\d+)(?:\s+(?<OSVersion>\d{2}H[12]|\d{4}))?(?:\s+(?<Arch>x64|x86|arm64))?$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($osMatch.Success) {
+        $osName = ConvertTo-NormalizedOSName -Value $osMatch.Groups['OSName'].Value
+        if ($osMatch.Groups['OSVersion'].Success) { $osVersion = $osMatch.Groups['OSVersion'].Value.ToUpper() }
+        if ($osMatch.Groups['Arch'].Success) { $architecture = $osMatch.Groups['Arch'].Value.ToLower() }
+    }
+    else {
+        $osNameMatch = [regex]::Match($osSegment, '(?i)Windows\s+\d+')
+        if ($osNameMatch.Success) {
+            $osName = ConvertTo-NormalizedOSName -Value $osNameMatch.Value
+        }
+        $versionMatch = [regex]::Match($osSegment, '(?i)(\d{2}H[12]|\d{4})')
+        if ($versionMatch.Success) {
+            $osVersion = $versionMatch.Groups[1].Value.ToUpper()
+        }
+        $archMatch = [regex]::Match($osSegment, '(?i)(x64|x86|arm64)')
+        if ($archMatch.Success) {
+            $architecture = $archMatch.Groups[1].Value.ToLower()
+        }
+    }
+
+    return [pscustomobject]@{
+        LabelModel   = $labelModel
+        OSName       = $osName
+        OSVersion    = $osVersion
+        Architecture = $architecture
+        OSSegment    = $osSegment
+    }
+}
+
+function Get-DriverPackageRenameCandidates {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [object[]]$Packages
+    )
+
+    $candidates = foreach ($pkg in $Packages) {
+        $name = [string]$pkg.Name
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+        $parsed = Parse-DriverPackageName -Name $name
+        if (-not $parsed) { continue }
+
+        $osSortKey = switch ($parsed.OSName) {
+            "Windows 10" { 10 }
+            "Windows 11" { 11 }
+            default { 99 }
+        }
+
+        [pscustomobject]@{
+            Name             = $name
+            PackageID        = [string]$pkg.PackageID
+            Manufacturer     = [string]$pkg.Manufacturer
+            Version          = [string]$pkg.Version
+            SourcePath       = [string]$pkg.SourcePath
+            LabelModel       = [string]$parsed.LabelModel
+            OSName           = [string]$parsed.OSName
+            OSVersion        = [string]$parsed.OSVersion
+            Architecture     = [string]$parsed.Architecture
+            OSSortKey        = $osSortKey
+            OSVersionSortKey = Get-OSVersionSortKey -OSVersion $parsed.OSVersion
+        }
+    }
+
+    return @($candidates | Sort-Object -Property OSSortKey, OSVersionSortKey, Manufacturer, LabelModel, Architecture)
+}
+
+function Rename-DriverPackages {
+    <#
+    .SYNOPSIS
+        Bulk rename SCCM driver package names by OS version.
+    .DESCRIPTION
+        Supports interactive prompts from Start-DATCLI and direct invocation.
+        Package names are parsed and rebuilt so model/manufacturer/arch portions
+        stay unchanged while OS version token is updated.
+    .PARAMETER Make
+        OEM filter: Lenovo, Dell, HP, Microsoft, Custom, or All.
+    .PARAMETER OSName
+        Optional OS family filter (Windows 10 / Windows 11 / All). If omitted, prompt.
+    .PARAMETER TargetOSVersion
+        Target OS version token (for example 22H2, 23H2, 24H2, or 2025).
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param (
+        [ValidateSet("Lenovo", "Dell", "HP", "Microsoft", "Custom", "All")]
+        [string]$Make = "All",
+
+        [ValidateSet("Windows 10", "Windows 11", "All")]
+        [string]$OSName,
+
+        [string]$TargetOSVersion
+    )
+
+    Write-LogEntry -Value "======== Starting Rename-DriverPackages ========" -Severity 1
+    $Settings = Get-DASettings
+    if (-not (Test-DASettings)) { return }
+
+    $SiteServer = $Settings.SiteServer
+    if (-not (Initialize-SCCMConnection)) {
+        Write-LogEntry -Value "[Error] - Failed to connect to ConfigMgr." -Severity 3
+        return
+    }
+
+    $packages = if ($Make -eq "All") {
+        @(
+            @(Get-Packages -Make All) +
+            @(Get-Packages -Make Custom)
+        ) | Where-Object { $_ } | Sort-Object -Property PackageID -Unique
+    }
+    else {
+        @(Get-Packages -Make $Make)
+    }
+    if (-not $packages) {
+        Write-LogEntry -Value "[Warning] - No packages found for rename scope '$Make'." -Severity 2
+        return
+    }
+
+    $candidates = Get-DriverPackageRenameCandidates -Packages $packages
+    if (-not $candidates) {
+        Write-LogEntry -Value "[Warning] - No package names matched expected naming format for rename." -Severity 2
+        Write-Host "  No parseable package names found. Expected pattern:" -ForegroundColor Yellow
+        Write-Host "  Drivers - <Make/Manufacturer> <Model> - Windows <10|11> <Version> <Arch>" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  Rename candidates (sorted by OS and OS version):" -ForegroundColor Cyan
+    $candidates |
+    Select-Object PackageID, Manufacturer, OSName, OSVersion, Architecture, Name |
+    Format-Table -AutoSize
+
+    $effectiveOSName = $OSName
+
+    if (-not $effectiveOSName) {
+        Write-Host ""
+        Write-Host "  Select OS family:" -ForegroundColor Cyan
+        Write-Host "    [1] Windows 10"
+        Write-Host "    [2] Windows 11"
+        Write-Host "    [3] All"
+        Write-Host "    [B] Cancel"
+        $osChoice = Read-Host "  Selection"
+        switch ($osChoice.ToUpper()) {
+            "1" { $effectiveOSName = "Windows 10" }
+            "2" { $effectiveOSName = "Windows 11" }
+            "3" { $effectiveOSName = "All" }
+            "B" { return }
+            default {
+                Write-Host "  Invalid selection. Rename cancelled." -ForegroundColor Yellow
+                return
+            }
+        }
+    }
+
+    if (-not $TargetOSVersion) {
+        Write-Host ""
+        $TargetOSVersion = Read-Host "  Enter target OS version (example: 24H2)"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($TargetOSVersion)) {
+        Write-Host "  Target OS version is required. Rename cancelled." -ForegroundColor Yellow
+        return
+    }
+    $TargetOSVersion = $TargetOSVersion.Trim().ToUpper()
+
+    $selected = if ($effectiveOSName -eq "All") {
+        $candidates
+    }
+    else {
+        @($candidates | Where-Object { $_.OSName -eq $effectiveOSName })
+    }
+
+    if (-not $selected -or $selected.Count -eq 0) {
+        Write-Host "  No packages matched the selected rename scope." -ForegroundColor Yellow
+        return
+    }
+
+    $renamePlan = foreach ($item in $selected) {
+        $newNameParts = @("Drivers", "-", $item.LabelModel, "-", $item.OSName, $TargetOSVersion)
+        if ($item.Architecture) { $newNameParts += $item.Architecture }
+        $newName = ($newNameParts -join ' ')
+
+        [pscustomobject]@{
+            PackageID = $item.PackageID
+            OldName   = $item.Name
+            NewName   = $newName
+            Changed   = ($item.Name -ne $newName)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Planned renames:" -ForegroundColor Cyan
+    $renamePlan |
+    Select-Object PackageID, OldName, NewName |
+    Format-Table -AutoSize
+
+    $changeCount = @($renamePlan | Where-Object { $_.Changed }).Count
+    if ($changeCount -eq 0) {
+        Write-Host "  All selected package names already match target version '$TargetOSVersion'." -ForegroundColor Yellow
+        return $renamePlan
+    }
+
+    Write-Host ""
+    $confirm = Read-Host "  Proceed with renaming $changeCount package(s)? (Y/N) [N]"
+    if (-not $confirm -or $confirm.ToUpper() -ne "Y") {
+        Write-Host "  Rename cancelled." -ForegroundColor Yellow
+        return
+    }
+
+    $allDriverPackages = @(
+        Get-CMPackage -SiteServer $SiteServer -NameFilter "startswith(Name,'Drivers -')" -TimeoutSec 60
+    )
+    $nameToPackageIds = @{}
+    foreach ($pkg in $allDriverPackages) {
+        if (-not $pkg.Name) { continue }
+        if (-not $nameToPackageIds.ContainsKey($pkg.Name)) {
+            $nameToPackageIds[$pkg.Name] = @()
+        }
+        $nameToPackageIds[$pkg.Name] += [string]$pkg.PackageID
+    }
+
+    $results = foreach ($entry in $renamePlan | Where-Object { $_.Changed }) {
+        $conflict = $false
+        if ($nameToPackageIds.ContainsKey($entry.NewName)) {
+            $ownerIds = @($nameToPackageIds[$entry.NewName])
+            $conflict = (@($ownerIds | Where-Object { $_ -ne $entry.PackageID }).Count -gt 0)
+        }
+
+        if ($conflict) {
+            Write-LogEntry -Value "[Warning] - Rename skipped for $($entry.PackageID): target name already exists ($($entry.NewName))." -Severity 2
+            [pscustomobject]@{
+                PackageID = $entry.PackageID
+                OldName   = $entry.OldName
+                NewName   = $entry.NewName
+                Status    = "Skipped (target name exists)"
+            }
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($entry.PackageID, "Rename package to '$($entry.NewName)'")) {
+            $updated = Set-CMPackage -SiteServer $SiteServer -PackageID $entry.PackageID -Properties @{ Name = $entry.NewName }
+            if ($updated) {
+                if (-not $nameToPackageIds.ContainsKey($entry.NewName)) {
+                    $nameToPackageIds[$entry.NewName] = @()
+                }
+                $nameToPackageIds[$entry.NewName] += $entry.PackageID
+                [pscustomobject]@{
+                    PackageID = $entry.PackageID
+                    OldName   = $entry.OldName
+                    NewName   = $entry.NewName
+                    Status    = "Renamed"
+                }
+            }
+            else {
+                [pscustomobject]@{
+                    PackageID = $entry.PackageID
+                    OldName   = $entry.OldName
+                    NewName   = $entry.NewName
+                    Status    = "Failed"
+                }
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Rename results:" -ForegroundColor Cyan
+    if ($results) {
+        $results | Format-Table -AutoSize
+    }
+    else {
+        Write-Host "  No changes were applied." -ForegroundColor Yellow
+    }
+
+    $renamedCount = @($results | Where-Object { $_.Status -eq "Renamed" }).Count
+    $skippedCount = @($results | Where-Object { $_.Status -like "Skipped*" }).Count
+    $failedCount = @($results | Where-Object { $_.Status -eq "Failed" }).Count
+    Write-LogEntry -Value "- Rename-DriverPackages complete. Renamed=$renamedCount Skipped=$skippedCount Failed=$failedCount" -Severity 1
+
+    return $results
+}
+
 function Get-Packages {
     <#
     .SYNOPSIS
@@ -5544,7 +5856,7 @@ function Start-DATCLI {
             "4" {
                 $pkgMenuLoop = $true
                 while ($pkgMenuLoop) {
-                    $pkgChoice = Show-SubMenu -Title "Browse Packages" -Items @("Browse Packages", "Check for Updates") -Breadcrumb "Browse Packages"
+                    $pkgChoice = Show-SubMenu -Title "Browse Packages" -Items @("Browse Packages", "Check for Updates", "Rename Packages") -Breadcrumb "Browse Packages"
                     if ($pkgChoice -eq "1") {
                         $filterLoop = $true
                         while ($filterLoop) {
@@ -5572,6 +5884,17 @@ function Start-DATCLI {
                         Write-Host ""
                         Update-Packages -HighlightUpdates
                         Read-Host "  Press Enter to continue"
+                    }
+                    elseif ($pkgChoice -eq "3") {
+                        Write-Host ""
+                        Write-Host "  Starting package rename workflow..." -ForegroundColor Green
+                        Write-Host ""
+                        $renameMakeChoice = Show-SubMenu -Title "Rename Packages - Filter by OEM" -Items @("All Manufacturers", "Lenovo", "Dell", "HP", "Microsoft", "Custom") -Breadcrumb "Browse Packages > Rename > Filter"
+                        if ($renameMakeChoice -match '^[1-6]$') {
+                            $renameMakeMap = @{ "1" = "All"; "2" = "Lenovo"; "3" = "Dell"; "4" = "HP"; "5" = "Microsoft"; "6" = "Custom" }
+                            Rename-DriverPackages -Make $renameMakeMap[$renameMakeChoice]
+                            Read-Host "  Press Enter to continue"
+                        }
                     }
                     elseif ($pkgChoice -eq "B") {
                         $pkgMenuLoop = $false
@@ -5679,6 +6002,7 @@ Export-ModuleMember -Function @(
     'Get-CustomDrivers',
     # Package Management
     'Get-Packages',
+    'Rename-DriverPackages',
     'Find-DriverModel',
     'Update-Packages',
     # Interactive CLI

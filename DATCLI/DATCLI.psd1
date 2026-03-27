@@ -12,7 +12,7 @@
 RootModule = 'DATCLI.psm1'
 
 # Version number of this module.
-ModuleVersion = '2.2.1'
+ModuleVersion = '2.4.0'
 
 # Supported PSEditions
 # CompatiblePSEditions = @()
@@ -73,7 +73,7 @@ FunctionsToExport = 'Get-DASettings', 'Set-DASettings', 'Find-LenovoModel',
                'Get-LenovoDrivers', 'Find-DellModel', 'Get-DellDrivers', 
                'Find-HPModel', 'Get-HPDrivers', 'Find-MicrosoftModel', 
                'Get-MicrosoftDrivers', 'Get-CustomDrivers', 'Get-Packages', 
-               'Find-DriverModel', 'Update-Packages', 'Start-DATCLI', 
+               'Rename-DriverPackages', 'Find-DriverModel', 'Update-Packages', 'Start-DATCLI', 
                'Start-DriverAutomationCLI'
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
@@ -134,4 +134,5 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
+
 

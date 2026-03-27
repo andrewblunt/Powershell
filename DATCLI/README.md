@@ -1,6 +1,6 @@
 # DATCLI (Driver Automation Tool CLI)
 
-Current version: **2.2.2**
+Current version: **2.4.0**
 See `CHANGELOG.md` for release history.
 
 A modular PowerShell CLI for automating driver pack download, extraction, SCCM package creation, and distribution. Supports Lenovo, Dell, HP, Microsoft Surface, and custom driver packages. Designed for ConfigMgr environments with an interactive menu-driven interface.
@@ -48,7 +48,7 @@ A modular PowerShell CLI for automating driver pack download, extraction, SCCM p
 The `Start-DATCLI` command launches a menu-driven interface:
 
 ```
-  DATCLI 2.2.2 > Main Menu
+  DATCLI 2.4.0 > Main Menu
 
     Connected:  your.sccm.server
     Catalogs:   LenovoXML 3.2h | DellXML 3.2h | HPXML 3.2h | build-driverpack 3.2h
@@ -77,6 +77,10 @@ Select an OEM to start the driver download workflow. The tool will:
 
 ### Browse Packages
 View existing driver packages in your SCCM site, filterable by OEM.
+
+Also includes:
+- **Check for Updates** - Compare existing SCCM package versions with catalog metadata
+- **Rename Packages** - Bulk rename package names by OEM + OS family to a target OS version token
 
 ## Settings (DASettings.json)
 
@@ -133,6 +137,10 @@ Get-Packages
 # List packages for a specific OEM
 Get-Packages -Make Lenovo
 
+# Bulk-rename package names to a new OS version token
+Rename-DriverPackages -Make Lenovo -OSName "Windows 11" -TargetOSVersion "24H2"
+Rename-DriverPackages -Make All -OSName "All" -TargetOSVersion "24H2"
+
 # Check for outdated packages
 Update-Packages
 Update-Packages -Make Dell
@@ -163,6 +171,7 @@ Set-DASettings
 | `Find-MicrosoftModel` | Search Microsoft catalog |
 | `Get-CustomDrivers` | Create custom driver package from local folder |
 | `Get-Packages` | List SCCM driver packages |
+| `Rename-DriverPackages` | Bulk rename SCCM driver package names by OS version |
 | `Find-DriverModel` | Search all OEM catalogs |
 | `Update-Packages` | Check packages against catalog versions |
 | `Get-DASettings` | View current settings |
@@ -180,3 +189,4 @@ Set-DASettings
 - If namespace errors occur, set `SCCMNamespace` in `DASettings.json`
 - Run `Test-DASettings` to validate all required settings are configured
 - Check `Logs/` directory for detailed error information
+

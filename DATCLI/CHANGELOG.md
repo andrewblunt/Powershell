@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.4.0 - 2026-03-27
+- Added new package rename workflow: `Rename-DriverPackages` for bulk SCCM driver package renaming by target OS version.
+- Added rename candidate parsing/sorting by OS family and OS version to improve reviewability before changes.
+- Added safety checks in rename workflow:
+  - preview of old/new names before applying
+  - confirmation prompt before commit
+  - collision detection to skip target names already used by other packages
+- Streamlined interactive rename prompts by replacing the separate scope prompt with direct OS family selection:
+  - `Windows 10`
+  - `Windows 11`
+  - `All`
+- Updated interactive CLI navigation to place rename workflow under `Browse Packages`:
+  - `Main Menu > Browse Packages > Rename Packages`
+- Updated README and agent guidance docs for version `2.4.0` and package-rename workflow.
+
 ## 2.3.0 - 2026-03-27
 - Refactored `Get-LenovoDrivers`, `Get-DellDrivers`, and `Get-HPDrivers` by centralizing the duplicated package creation, distribution, and cleanup logic into a new shared helper function `Publish-DriverPackage`.
 - Reduced module size and improved long-term maintainability.
